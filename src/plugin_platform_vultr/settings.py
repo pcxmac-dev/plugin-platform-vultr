@@ -30,7 +30,8 @@ KEYS = (
            hint=f"{WHERE_KEY}: Enable API, then copy the Personal Access Token; {ACCESS_CONTROL}"),
     KeyVar(DDNS_HOSTS, label="Dynamic DNS hosts", secret=False,
            hint="optional: the hosts kept at this network's address, comma separated, in domains on Vultr's DNS: "
-                "home.example.com, @.example.com (the domain itself)"),
+                "home.example.com, @.example.com (the domain itself). A host with no A record is made; one holding "
+                "another address, or several, is left as it is until you take it over on the plugin's page"),
     KeyVar(DDNS_MINUTES, label="Dynamic DNS minutes", secret=False,
            hint="optional: minutes between Dynamic DNS checks, 1 to 1440 (5 unless set)"),
 )

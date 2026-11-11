@@ -6,9 +6,10 @@ TCP, UDP, GRE, ESP, AH), `port` (TCP/UDP only: a port or a colon separated range
 no rule lets in is dropped.
 
 So a change is risky, and asked twice (`ACCEPT`), when it:
-- lets SSH (TCP port 22) or every port in from the whole internet (a subnet of size 0);
-- is a group's first rule while instances are linked to it: from then on everything else is dropped, SSH too, unless the
-  rule lets SSH in;
+- lets every port in from the whole internet (a subnet of size 0), or a way to control a server from afar (REMOTE: SSH,
+  RDP, VNC, Docker's API);
+- is a group's first rule while instances are linked to it, whatever it lets in (0.1.1: an audit found one letting SSH in
+  asked once): from then on everything else is dropped, a website on 80 or 443 too;
 - removes a group's last rule while instances are linked to it: the group is no longer enforced, every port open again;
 - removes the only rule letting SSH in to the instances linked to the group.
 A TCP or UDP rule without a port is taken as letting every port in (Vultr's docs do not say what one admits): the page
@@ -32,6 +33,7 @@ PROTOCOLS = {  # what the page's form adds, in the order offered, with what each
 }
 PORTED = frozenset({"tcp", "udp"})
 SSH = 22
+REMOTE = {22: "SSH", 3389: "RDP", 5900: "VNC", 2375: "Docker's API", 2376: "Docker's API over TLS"}  # TCP ports controlling a server
 NOTES_MAX = 255  # the CLI's reference: notes "up to 255 characters"
 
 
@@ -178,13 +180,19 @@ def plural(n: int, word: str) -> str:
 def risk_of_adding(new: Rule, rules: Sequence[Rule], linked: int) -> str:
     """Why adding `new` to a group holding `rules`, with `linked` instances, is risky ("" when it is not)."""
     why = []
-    if new.everyone and new.admits(SSH):
-        why.append("it lets SSH (TCP port 22) in from the whole internet" + (" (every port, in fact)" if new.every_port else ""))
-    elif new.everyone and new.every_port:
-        why.append(f"it lets every {new.protocol.upper()} port in from the whole internet")
-    if not rules and linked and not new.admits(SSH):
-        why.append(f"it is the group's first rule: Vultr enforces a group once it holds one, so from then on everything "
-                   f"else is dropped on its {plural(linked, 'instance')}, SSH too")
+    if new.everyone and new.every_port:
+        why.append(f"it lets every {new.protocol.upper()} port in from the whole internet"
+                   + (" (SSH, RDP and every other service)" if new.protocol == "tcp" else ""))
+    elif new.everyone:
+        opened = [f"{what} (TCP {port})" for port, what in REMOTE.items() if new.admits(port)]
+        if opened:
+            why.append(f"it lets {', '.join(opened)} in from the whole internet")
+    if not rules and linked:
+        them = plural(linked, "instance")
+        why.append(f"it is the group's first rule while {them} {'is' if linked == 1 else 'are'} linked to it: Vultr enforces "
+                   "a group once it holds a rule, so from then on every other inbound connection to them is dropped (a "
+                   "website on 80 or 443, any other service" + ("" if new.admits(SSH) else ", SSH too")
+                   + "): only what this rule lets in still reaches them")
     return "; ".join(why)
 
 
@@ -206,8 +214,9 @@ def same_rule(a: Rule, b: Rule) -> bool:
                                                                           b.source)
 
 
-def refuse_risky(why: str, accepted: bool) -> None:
-    """Refusal naming ACCEPT when a change is risky and that was not accepted."""
-    if why and not accepted:
+def refuse_risky(why: str, accepted) -> None:
+    """Refusal naming ACCEPT when a change is risky and that was not accepted: `accepted` counts only when it is True
+    itself (the page sends JSON true; a string such as "false", or a 1, from another program is no acceptance)."""
+    if why and accepted is not True:
         raise Refusal(f"risky: {why}. Nothing was sent: it is made only once that is accepted ({ACCEPT}: the platform's page "
                       "asks again; the command line asks twice)", accept=ACCEPT)

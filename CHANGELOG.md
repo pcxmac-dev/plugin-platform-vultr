@@ -1,5 +1,38 @@
 # Changelog
 
+## 0.1.1 (2026-11-11)
+
+What an audit of the cloud plugins found before any key went in (session 87405e6a: eight reviewers, a skeptic per
+finding; FIX-clouds.md), fixed. Needs liminal-libs>=1.49.2.
+
+- **Dynamic DNS changes only what is its own** (the library's 1.49.2 Keeper): a host with no A record (made), one already
+  pointing at this network or at the address it set last (kept current, after a restart too: its state in the platform's
+  folder, `vultr/ddns.json`), and one you take over on the page. A host holding another address, or several, is left as
+  it is, its row offering **Take over…** (confirmed, naming what it holds and that what answers there stops answering);
+  several addresses are never cut to one unasked. **Update DNS now** is a confirmed form, no longer one click. The
+  address is asked again just before a write. A host taken out of the settings is let go. (The audit: saving a host had
+  its live record pointed at home, and its other addresses deleted, within a minute.)
+- **Set a record… and Add a record…, each saying what it does**: Set (A, AAAA, CNAME) replaces the host's records of its
+  type, its confirmation says so, and it asks a second time, naming them, before any other record of that type goes
+  (`accept_replace`); Add (every type but CNAME) adds beside the host's others, all kept. The command line has `set` and
+  `add` alike. (The audit: the set's confirmation said every other record was kept while it deleted the host's others.)
+- **A group's first firewall rule is asked twice** while instances are linked to it, whatever it lets in: from then on
+  Vultr drops everything else (a website on 80 and 443 too). Opening a remote-control port to everyone (SSH, RDP, VNC,
+  Docker's API) or every port is asked twice too. (The audit: a first rule letting SSH in was asked once, its dialog
+  promising a second ask.)
+- **A second confirmation counts only when it is True itself**: a string such as "false" or "yes", or a 1, from another
+  program is refused like a missing one (accept_reboot, accept_halt, accept_risk, accept_replace).
+- **A change is named by what the page showed**: a power change needs the instance's label, a record removed its name,
+  type and data, a rule removed its protocol, port and source, a key removed its name (none by its ID alone).
+- **The background runs only under the platform, and only set up**: attached by the charts app run alone, or with no key
+  set, no thread starts; the key entered on the page starts it. Once detached, a refresh or a pass under way reads and
+  writes nothing more, and no setting is read from the process's environment.
+- **A read that does not get through** (no answer, a 429, a 5xx) leaves the plugin valid, said as its problem and tried
+  again two minutes later (the audit: one dropped connection turned it grey for a quarter of an hour).
+- **An instance's console link** (Vultr's `kvm`, a token in its query) is never handed on by `servers` or the command line.
+- The key field of Add a key… is marked `secret` (for the platform, which logs a hook's arguments: the audit's blocker
+  there is the platform's to fix).
+
 ## 0.1.0 (2026-11-11)
 
 The first release (the user: "lets roll plugins for EC2, vultr, azure and google cloud"; for the clouds, "Free changes

@@ -1,7 +1,8 @@
 """The platform's page changes the account through the plugin's forms (status.forms): each form's fields the hook's
 arguments in order, each change confirmed with what it does named, and its hook sending exactly the request the reference
-gives (method, path, body), the zone, the group or the keys read before and after it; a halt and a risky firewall rule
-change refused until accepted a second time. Over the stand-ins alone."""
+gives (method, path, body), the zone, the group or the keys read before and after it; a reboot, a halt, a set removing
+other records and a risky firewall rule change refused until accepted a second time, an acceptance counting only when it
+is True itself. Over the stand-ins alone."""
 from __future__ import annotations
 
 import inspect
@@ -9,7 +10,7 @@ import inspect
 import pytest
 
 from conftest import DB, G_EMPTY, G_LONE, G_WEB, HOME, NEW, WEB, FakeVultr, public_key, settings_of
-from plugin_platform_vultr import ACCEPT_HALT, ACCEPT_REBOOT, ACCEPT_RISK
+from plugin_platform_vultr import ACCEPT_HALT, ACCEPT_REBOOT, ACCEPT_REPLACE, ACCEPT_RISK
 from plugin_platform_vultr.records import Refusal
 
 
@@ -48,10 +49,10 @@ def since(fake, n):
 
 def test_every_form_takes_its_hooks_arguments_in_order_and_names_its_change(made, env):
     p, fake, forms = ready(made, env)
-    assert sorted(forms) == sorted(["start", "reboot", "halt", "set:example.com", "remove:example.com", "set:example.net",
-                                    "remove:example.net", f"rule-add:{G_WEB}", f"rule-remove:{G_WEB}", f"rule-add:{G_EMPTY}",
-                                    f"rule-remove:{G_EMPTY}", f"rule-add:{G_LONE}", f"rule-remove:{G_LONE}", "key-add",
-                                    "key-remove"])
+    assert sorted(forms) == sorted(["start", "reboot", "halt", "set:example.com", "add:example.com", "remove:example.com",
+                                    "set:example.net", "add:example.net", "remove:example.net", f"rule-add:{G_WEB}",
+                                    f"rule-remove:{G_WEB}", f"rule-add:{G_EMPTY}", f"rule-remove:{G_EMPTY}",
+                                    f"rule-add:{G_LONE}", f"rule-remove:{G_LONE}", "key-add", "key-remove"])
     hooks = p.interface()["hooks"]
     for f in forms.values():
         assert f["hook"] in hooks
@@ -66,18 +67,25 @@ def test_every_form_takes_its_hooks_arguments_in_order_and_names_its_change(made
     (again,) = [x for x in forms["reboot"]["fields"] if x["type"] == "accept"]
     assert again["name"] == ACCEPT_REBOOT and "hard restart" in again["words"] and "may be lost" in again["words"]
     assert "{label}" in again["words"] and not [x for x in forms["start"]["fields"] if x["type"] == "accept"]  # start: once
-    assert "adds nothing to its charge" in forms["start"]["confirm"]["words"]
-    s = forms["set:example.com"]
-    assert [c["value"] for c in next(x for x in s["fields"] if x["name"] == "rtype")["choices"]] == [
-        "A", "AAAA", "CNAME", "TXT", "MX", "NS", "SRV", "CAA", "SSHFP"]
-    assert next(x for x in s["fields"] if x["name"] == "priority")["when"] == {"rtype": ["MX", "SRV"]}
+    assert "adds nothing to its charge" in forms["start"]["confirm"]["words"]  # Vultr bills it running or stopped
+    assert "running or stopped" in forms["start"]["confirm"]["words"]
+    # Set a record… replaces, and says so; Add a record… keeps the rest, and says so (the audit: they disagreed)
+    s, a = forms["set:example.com"], forms["add:example.com"]
+    assert [c["value"] for c in next(x for x in s["fields"] if x["name"] == "rtype")["choices"]] == ["A", "AAAA", "CNAME"]
+    assert [c["value"] for c in next(x for x in a["fields"] if x["name"] == "rtype")["choices"]] == [
+        "A", "AAAA", "TXT", "MX", "NS", "SRV", "CAA", "SSHFP"]
+    assert "it replaces the host's {rtype} records" in s["confirm"]["words"] and "Every other record" not in s["confirm"]["words"]
+    assert [x["name"] for x in s["fields"] if x["type"] == "accept"] == [ACCEPT_REPLACE]
+    assert "every other record is kept" in a["confirm"]["words"] and not [x for x in a["fields"] if x["type"] == "accept"]
+    assert next(x for x in a["fields"] if x["name"] == "priority")["when"] == {"rtype": ["MX", "SRV"]}
     assert next(x for x in s["fields"] if x["name"] == "data")["placeholder"] == HOME
-    assert "{name} {rtype} {data}" in s["confirm"]["words"] and "Every other record is kept" in s["confirm"]["words"]
     add = forms[f"rule-add:{G_WEB}"]
     assert next(x for x in add["fields"] if x["name"] == "port")["when"] == {"protocol": ["tcp", "udp"]}
     assert next(x for x in add["fields"] if x["name"] == "subnet")["note"] == f"this network's address: {HOME}"
     assert [x["name"] for x in add["fields"] if x["type"] == "accept"] == [ACCEPT_RISK]
+    assert "the group's first rule while instances are linked" in add["confirm"]["words"]
     assert forms[f"rule-remove:{G_WEB}"]["confirm"]["danger"] is True and forms["key-remove"]["confirm"]["danger"] is True
+    assert next(x for x in forms["key-add"]["fields"] if x["name"] == "ssh_key")["secret"] is True
     assert not fake.writes()  # drawn: nothing changed
 
 
@@ -100,7 +108,7 @@ def test_start_and_reboot_send_the_references_requests(made, env):
     rep = p.ask("reboot", *page_args(forms["reboot"], reboot["values"], accepted={ACCEPT_REBOOT}))
     assert rep["said"] == "web-1 rebooted" and since(fake, n)[1] == ("POST", f"/instances/{WEB}/reboot", None)
     # what the plugin refuses comes back in its words, nothing sent: a server already running, one not active yet, a
-    # server renamed since the page showed it
+    # server renamed since the page showed it, one named by its ID alone
     n = len(fake.requests)
     with pytest.raises(Refusal, match="running already"):
         p.ask("start", WEB, "web-1")
@@ -108,6 +116,8 @@ def test_start_and_reboot_send_the_references_requests(made, env):
         p.ask("reboot", NEW, "new-1")
     with pytest.raises(Refusal, match="is web-1 now, not web-old"):
         p.ask("reboot", WEB, "web-old")
+    with pytest.raises(ValueError, match="by its name as the page shows it"):
+        p.ask("start", DB)
     assert [m for m, path, b in since(fake, n)] == ["GET", "GET", "GET"]
 
 
@@ -128,63 +138,97 @@ def test_a_halt_is_made_only_once_it_is_accepted_a_second_time(made, env):
     assert row[9]["form"] == "start"  # drawn as read after it: Start… now
 
 
-def test_a_record_is_set_with_every_other_record_kept(made, env):
-    p, fake, forms = ready(made, env)
-    s = forms["set:example.com"]
-    before = fake.zone()
-    n = len(fake.requests)
-    args = page_args(s, {"name": "blog", "rtype": "A", "data": "203.0.113.30", "ttl": "", "priority": "5"})
-    assert args == ["example.com", "blog", "A", "203.0.113.30", None, None]  # a priority hidden for an A record: not sent
-    rep = p.ask("set_record", *args)
-    assert since(fake, n) == [("GET", "/domains/example.com/records", None),
-                              ("POST", "/domains/example.com/records", {"name": "blog", "type": "A", "data": "203.0.113.30"}),
-                              ("GET", "/domains/example.com/records", None)]
-    assert rep["ok"] and rep["said"] == "added blog A 203.0.113.30" and fake.zone() == [*before, ("blog", "A", "203.0.113.30")]
-    # the apex's A record replaced: its own record updated, nothing else touched
-    n = len(fake.requests)
-    rep = p.ask("set_record", *page_args(s, {"name": "@", "rtype": "A", "data": "203.0.113.11", "ttl": "600"}))
-    assert since(fake, n)[1] == ("PATCH", "/domains/example.com/records/a0a0a0a0-0000-4000-8000-000000000001",
-                                 {"data": "203.0.113.11", "ttl": 600})
-    assert rep["said"] == "set @ A 203.0.113.11 (it was 203.0.113.10)" and rep["ok"]
-    # a TXT record is added beside the others, its text in double quotes as Vultr's DNS keeps it
-    n = len(fake.requests)
-    rep = p.ask("set_record", *page_args(s, {"name": "_dmarc", "rtype": "TXT", "data": "v=DMARC1; p=quarantine"}))
-    assert since(fake, n)[1] == ("POST", "/domains/example.com/records",
-                                 {"name": "_dmarc", "type": "TXT", "data": '"v=DMARC1; p=quarantine"'})
-    rep = p.ask("set_record", "example.com", "@", "TXT", "v=spf1 include:_spf.protonmail.ch ~all", None, None)
-    assert rep["changed"] is False and "nothing written" in rep["said"]  # there already (quoted or not)
-    n = len(fake.requests)
-    rep = p.ask("set_record", *page_args(s, {"name": "@", "rtype": "MX", "data": "mailsec.protonmail.ch", "priority": "20"}))
-    assert since(fake, n)[1] == ("POST", "/domains/example.com/records",
-                                 {"name": "", "type": "MX", "data": "mailsec.protonmail.ch", "priority": 20})
-    assert ("", "MX", "mail.protonmail.ch") in fake.zone()  # the other MX kept
-    # what the plugin refuses comes back in its words, nothing written
-    n = len(fake.requests)
-    with pytest.raises(ValueError, match="needs its priority"):
-        p.ask("set_record", "example.com", "@", "MX", "mail3.example.org", None, None)
-    with pytest.raises(ValueError, match="not an IPv4 address"):
-        p.ask("set_record", "example.com", "home", "A", "not-an-ip", None, None)
-    with pytest.raises(Refusal, match="cannot stand for the domain itself"):
-        p.ask("set_record", "example.com", "@", "CNAME", "other.example.org", None, None)
-    with pytest.raises(Refusal, match="www is a CNAME"):
-        p.ask("set_record", "example.com", "www", "TXT", "hello", None, None)
-    with pytest.raises(Refusal, match="not on this account's Vultr DNS"):
-        p.ask("set_record", "example.org", "www", "A", "203.0.113.1", None, None)
-    assert [path for m, path, b in since(fake, n)] == ["/domains/example.com/records"] * 4 + ["/domains"]  # reads only
-
-
-def test_setting_an_a_record_replaces_the_hosts_others_of_its_type(made, env):
+def test_a_second_confirmation_counts_only_when_it_is_true(made, env):
+    """The page sends JSON true; another program's "false", "yes", "0" or 1 is no acceptance (the audit: bool() took
+    "false" as yes and halted a server)."""
     fake = FakeVultr()
     fake.records["example.com"].append({"id": "a0a0a0a0-0000-4000-8000-000000000007", "type": "A", "name": "home",
                                         "data": "198.51.100.8", "ttl": 120, "priority": 0})
     p, fake, forms = ready(made, env, fake)
+    for no in ("false", "true", "yes", "0", 1, 1.0, [True]):
+        with pytest.raises(Refusal, match="accepted a second time"):
+            p.ask("halt", WEB, "web-1", no)
+        with pytest.raises(Refusal, match="accepted a second time"):
+            p.ask("reboot", WEB, "web-1", no)
+        with pytest.raises(Refusal, match="risky"):
+            p.ask("add_rule", G_WEB, "v4", "tcp", "22", "0.0.0.0", 0, "", no)
+        with pytest.raises(Refusal, match="replaces them all"):
+            p.ask("set_record", "example.com", "home", "A", HOME, None, no)
+    assert fake.writes() == [] and fake.instances[0]["power_status"] == "running"
+    assert p.ask("halt", WEB, "web-1", True)["said"] == "web-1 halted"  # True itself
+
+
+def test_a_record_set_replaces_and_one_added_keeps_the_rest(made, env):
+    p, fake, forms = ready(made, env)
+    s, a = forms["set:example.com"], forms["add:example.com"]
+    before = fake.zone()
     n = len(fake.requests)
-    rep = p.ask("set_record", "example.com", "home", "A", HOME, None, None)
+    args = page_args(a, {"name": "blog", "rtype": "A", "data": "203.0.113.30", "ttl": "", "priority": "5"})
+    assert args == ["example.com", "blog", "A", "203.0.113.30", None, None]  # a priority hidden for an A record: not sent
+    rep = p.ask("add_record", *args)
+    assert since(fake, n) == [("GET", "/domains/example.com/records", None),
+                              ("POST", "/domains/example.com/records", {"name": "blog", "type": "A", "data": "203.0.113.30"}),
+                              ("GET", "/domains/example.com/records", None)]
+    assert rep["ok"] and rep["said"] == "added blog A 203.0.113.30" and fake.zone() == [*before, ("blog", "A", "203.0.113.30")]
+    # the apex's A record set: its one record updated, nothing else touched (asked once: nothing else goes)
+    n = len(fake.requests)
+    rep = p.ask("set_record", *page_args(s, {"name": "@", "rtype": "A", "data": "203.0.113.11", "ttl": "600"}))
+    assert since(fake, n)[1] == ("PATCH", "/domains/example.com/records/a0a0a0a0-0000-4000-8000-000000000001",
+                                 {"data": "203.0.113.11", "ttl": 600})
+    assert rep["said"] == "set @ A 203.0.113.11: it replaces 203.0.113.10" and rep["ok"]
+    # a TXT record is added beside the others, its text in double quotes as Vultr's DNS keeps it
+    n = len(fake.requests)
+    rep = p.ask("add_record", *page_args(a, {"name": "_dmarc", "rtype": "TXT", "data": "v=DMARC1; p=quarantine"}))
+    assert since(fake, n)[1] == ("POST", "/domains/example.com/records",
+                                 {"name": "_dmarc", "type": "TXT", "data": '"v=DMARC1; p=quarantine"'})
+    rep = p.ask("add_record", "example.com", "@", "TXT", "v=spf1 include:_spf.protonmail.ch ~all", None, None)
+    assert rep["changed"] is False and "nothing written" in rep["said"]  # there already (quoted or not)
+    n = len(fake.requests)
+    rep = p.ask("add_record", *page_args(a, {"name": "@", "rtype": "MX", "data": "mailsec.protonmail.ch", "priority": "20"}))
+    assert since(fake, n)[1] == ("POST", "/domains/example.com/records",
+                                 {"name": "", "type": "MX", "data": "mailsec.protonmail.ch", "priority": 20})
+    assert ("", "MX", "mail.protonmail.ch") in fake.zone() and "beside the host's 1 other MX record, kept" in rep["said"]
+    # what the plugin refuses comes back in its words, nothing written
+    n = len(fake.requests)
+    with pytest.raises(ValueError, match="needs its priority"):
+        p.ask("add_record", "example.com", "@", "MX", "mail3.example.org", None, None)
+    with pytest.raises(ValueError, match="not an IPv4 address"):
+        p.ask("set_record", "example.com", "home", "A", "not-an-ip", None, False)
+    with pytest.raises(Refusal, match="cannot stand for the domain itself"):
+        p.ask("set_record", "example.com", "@", "CNAME", "other.example.org", None, False)
+    with pytest.raises(Refusal, match="www is a CNAME"):
+        p.ask("add_record", "example.com", "www", "TXT", "hello", None, None)
+    with pytest.raises(ValueError, match="no record type here: A, AAAA, CNAME"):
+        p.ask("set_record", "example.com", "@", "TXT", "hello", None, False)  # a TXT is added, never set over others
+    with pytest.raises(ValueError, match="no record type here: A, AAAA, TXT"):
+        p.ask("add_record", "example.com", "alias", "CNAME", "example.com", None, None)  # a CNAME stands alone: set
+    with pytest.raises(Refusal, match="not on this account's Vultr DNS"):
+        p.ask("set_record", "example.org", "www", "A", "203.0.113.1", None, False)
+    assert [path for m, path, b in since(fake, n)] == ["/domains/example.com/records"] * 6 + ["/domains"]  # reads only
+
+
+def test_setting_a_hosts_record_over_several_asks_before_the_others_go(made, env):
+    """The audit's case: api holds two A records; setting a third address replaces both, so it is asked again, naming
+    them; Add a record… keeps them."""
+    fake = FakeVultr()
+    fake.records["example.com"].append({"id": "a0a0a0a0-0000-4000-8000-000000000007", "type": "A", "name": "home",
+                                        "data": "198.51.100.8", "ttl": 120, "priority": 0})
+    p, fake, forms = ready(made, env, fake)
+    s = forms["set:example.com"]
+    n = len(fake.requests)
+    with pytest.raises(Refusal, match=r"home holds 2 A records: setting it to 93.184.216.34 replaces them all, so "
+                                      r"198.51.100.8 is removed") as refused:
+        p.ask("set_record", *page_args(s, {"name": "home", "rtype": "A", "data": HOME}))
+    assert refused.value.accept == ACCEPT_REPLACE and since(fake, n) == [("GET", "/domains/example.com/records", None)]
+    n = len(fake.requests)
+    rep = p.ask("set_record", *page_args(s, {"name": "home", "rtype": "A", "data": HOME}, accepted={ACCEPT_REPLACE}))
     assert since(fake, n)[1:3] == [("PATCH", "/domains/example.com/records/a0a0a0a0-0000-4000-8000-000000000006",
                                     {"data": HOME}),
                                    ("DELETE", "/domains/example.com/records/a0a0a0a0-0000-4000-8000-000000000007", None)]
     assert rep["ok"] and "the host's other A records removed (198.51.100.8)" in rep["said"]
     assert [r for r in fake.zone() if r[1] == "A" and "home" in r[0]] == [("home.example.com", "A", HOME)]
+    rep = p.ask("add_record", "example.com", "home", "A", "203.0.113.22", None, None)  # beside: both kept
+    assert rep["ok"] and [r[2] for r in fake.zone() if r[1] == "A" and "home" in r[0]] == [HOME, "203.0.113.22"]
 
 
 def test_a_record_is_removed_by_its_id_once_it_is_the_one_shown(made, env):
@@ -200,15 +244,17 @@ def test_a_record_is_removed_by_its_id_once_it_is_the_one_shown(made, env):
                               ("GET", "/domains/example.com/records", None)]
     assert rep["ok"] and rep["said"] == 'removed @ TXT "v=spf1 include:_spf.protonmail.ch ~all"'
     assert ("", "MX", "mail.protonmail.ch") in fake.zone() and len(fake.zone()) == 5
-    # one changed since the page showed it is not removed
+    # one changed since the page showed it is not removed, nor one named by its ID alone
     fake.records["example.com"][0]["data"] = "203.0.113.99"
     apex = {"record": "a0a0a0a0-0000-4000-8000-000000000001", "name": "@", "rtype": "A", "data": "203.0.113.10"}
     n = len(fake.requests)
     with pytest.raises(Refusal, match="not the one shown"):
         p.ask("remove_record", *page_args(rm, apex))
     with pytest.raises(Refusal, match="holds no record"):
-        p.ask("remove_record", "example.com", "a0a0a0a0-0000-4000-8000-000000000004", "@", "TXT", "")
-    assert [m for m, path, b in since(fake, n)] == ["GET", "GET"]
+        p.ask("remove_record", "example.com", "a0a0a0a0-0000-4000-8000-000000000004", "@", "TXT", "x")
+    with pytest.raises(ValueError, match="with its name, type and data as shown"):
+        p.ask("remove_record", "example.com", "a0a0a0a0-0000-4000-8000-000000000001")
+    assert [m for m, path, b in since(fake, n)] == ["GET", "GET", "GET"] and fake.records["example.com"][0]["data"] == "203.0.113.99"
 
 
 def test_a_rule_is_added_and_a_risky_one_only_once_accepted(made, env):
@@ -228,11 +274,15 @@ def test_a_rule_is_added_and_a_risky_one_only_once_accepted(made, env):
     # SSH open to the whole internet: refused until accepted, nothing sent
     risky = page_args(add, {"ip_type": "v4", "protocol": "tcp", "port": "22", "subnet": "0.0.0.0", "subnet_size": "0"})
     n = len(fake.requests)
-    with pytest.raises(Refusal, match=r"lets SSH \(TCP port 22\) in from the whole internet") as refused:
+    with pytest.raises(Refusal, match=r"lets SSH \(TCP 22\) in from the whole internet") as refused:
         p.ask("add_rule", *risky)
     assert refused.value.accept == ACCEPT_RISK and all(m == "GET" for m, path, b in since(fake, n))
     with pytest.raises(Refusal, match="every UDP port in from the whole internet"):
         p.ask("add_rule", G_WEB, "v6", "udp", "1:65535", "::", 0, "", False)
+    with pytest.raises(Refusal, match=r"lets RDP \(TCP 3389\) in from the whole internet"):
+        p.ask("add_rule", G_WEB, "v4", "tcp", "3389", "0.0.0.0", 0, "", False)
+    with pytest.raises(Refusal, match=r"lets Docker's API \(TCP 2375\), Docker's API over TLS \(TCP 2376\) in"):
+        p.ask("add_rule", G_WEB, "v4", "tcp", "2375:2376", "0.0.0.0", 0, "", False)
     rep = p.ask("add_rule", *page_args(add, {"ip_type": "v4", "protocol": "tcp", "port": "22", "subnet": "0.0.0.0",
                                              "subnet_size": "0"}, accepted={ACCEPT_RISK}))
     assert rep["ok"] and any(line.startswith("accepted as risky: it lets SSH") for line in rep["lines"])
@@ -251,15 +301,28 @@ def test_a_rule_is_added_and_a_risky_one_only_once_accepted(made, env):
     assert all(m == "GET" for m, path, b in since(fake, n))
 
 
-def test_a_groups_first_rule_is_risky_while_instances_are_linked_to_it(made, env):
+def test_a_groups_first_rule_is_asked_twice_while_instances_are_linked_to_it(made, env):
+    """The audit's case: a group without rules is not enforced; its first rule, even one letting SSH in from one address,
+    makes Vultr drop everything else (a website on 80 and 443), so it is asked again."""
     fake = FakeVultr()
     fake.groups[1]["instance_count"] = 2  # the spare group: no rules, two instances linked
     p, fake, forms = ready(made, env, fake)
     add = forms[f"rule-add:{G_EMPTY}"]
-    with pytest.raises(Refusal, match="the group's first rule: .* everything else is dropped on its 2 instances, SSH too"):
+    with pytest.raises(Refusal, match="the group's first rule while 2 instances are linked to it: .* dropped \\(a website on "
+                                      "80 or 443, any other service, SSH too\\)"):
         p.ask("add_rule", *page_args(add, {"protocol": "tcp", "port": "443", "subnet": "0.0.0.0", "subnet_size": "0"}))
-    rep = p.ask("add_rule", *page_args(add, {"protocol": "tcp", "port": "22", "subnet": HOME, "subnet_size": "32"}))
-    assert rep["ok"]  # its first rule lets SSH in from this network: not risky
+    ssh_only = page_args(add, {"protocol": "tcp", "port": "22", "subnet": HOME, "subnet_size": "32"})
+    with pytest.raises(Refusal, match=r"dropped \(a website on 80 or 443, any other service\): only what this rule lets in") \
+            as refused:
+        p.ask("add_rule", *ssh_only)
+    assert refused.value.accept == ACCEPT_RISK and fake.writes() == []
+    rep = p.ask("add_rule", *page_args(add, {"protocol": "tcp", "port": "22", "subnet": HOME, "subnet_size": "32"},
+                                       accepted={ACCEPT_RISK}))
+    assert rep["ok"] and fake.writes() == [("POST", f"/firewalls/{G_EMPTY}/rules",
+                                            {"ip_type": "v4", "protocol": "tcp", "subnet": HOME, "subnet_size": 32,
+                                             "port": "22"})]
+    rep = p.ask("add_rule", G_EMPTY, "v4", "tcp", "443", "0.0.0.0", 0, "https", False)  # its second rule: asked once
+    assert rep["ok"]
 
 
 def test_removing_the_rule_letting_ssh_in_or_a_groups_last_rule_is_asked_twice(made, env):
@@ -280,9 +343,11 @@ def test_removing_the_rule_letting_ssh_in_or_a_groups_last_rule_is_asked_twice(m
         p.ask("remove_rule", *page_args(forms[f"rule-remove:{G_LONE}"], lone["values"]))
     rep = p.ask("remove_rule", *page_args(forms[f"rule-remove:{G_LONE}"], lone["values"], accepted={ACCEPT_RISK}))
     assert rep["ok"] and fake.rules[G_LONE] == [] and rep["lines"][1].startswith("accepted as risky")
-    # a rule changed since it was shown is not removed
+    # a rule changed since it was shown is not removed, nor one named by its ID alone
     with pytest.raises(Refusal, match="not the one shown"):
         p.ask("remove_rule", G_WEB, "1", "TCP", "2222", "198.51.100.0/24", True)
+    with pytest.raises(ValueError, match="with its protocol, port and source as shown"):
+        p.ask("remove_rule", G_WEB, "1")
 
 
 def test_ssh_keys_are_added_and_removed(made, env):
@@ -300,6 +365,8 @@ def test_ssh_keys_are_added_and_removed(made, env):
         p.ask("add_key", "oops", "-----BEGIN OPENSSH PRIVATE KEY----- b3BlbnNzaC1rZXktdjEAAAAA -----END OPENSSH PRIVATE KEY-----")
     with pytest.raises(ValueError, match="not an OpenSSH public key"):
         p.ask("add_key", "bad", "ssh-ed25519 notbase64!!")
+    with pytest.raises(ValueError, match="with its name as shown"):
+        p.ask("remove_key", "3b8066a7-b438-455a-9688-44afc9a3597f")
     assert [m for m, path, b in since(fake, n)] == ["GET"]
     laptop = button(p.status(), "SSH keys", "key-remove", name="laptop")
     rep = p.ask("remove_key", *page_args(forms["key-remove"], laptop["values"]))

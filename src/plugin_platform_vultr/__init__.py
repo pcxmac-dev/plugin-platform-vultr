@@ -3,27 +3,34 @@
 plan's price a month and an hour, the domains on Vultr's DNS and their records, the firewall groups and their rules, the
 SSH keys, block storage, reserved IPs, and how many bare metal servers, snapshots, backups, Kubernetes clusters, load
 balancers and databases it holds), and the changes that cost nothing, each confirmed on the platform's page: an instance
-started, or rebooted or halted (each asked twice); a DNS record set or removed, every other record kept; a firewall rule
-added or removed (a risky one asked twice); an SSH key added or removed. Dynamic DNS keeps hosts at this network's public
-IPv4 address through Vultr's DNS. Nothing that starts a charge: no instance, volume, snapshot, backup or reserved IP is
-made, nothing resized, restored or destroyed. A stopped instance still bills: Vultr's docs say stopping an instance does
-not halt billing, only destroying it does.
+started, or rebooted or halted (each asked twice); a DNS record set (an A, AAAA or CNAME replacing the host's records
+of its type, asked again before any other goes), added beside the others, or removed; a firewall rule added or removed (a
+risky one asked twice); an SSH key added or removed. Dynamic DNS keeps hosts at this network's public IPv4 address
+through Vultr's DNS, changing only what is its own: a host it made, one already pointing here, one you took over on the
+page (liminal-libs 1.49.2's Keeper; 0.1.1, after an audit). Nothing that starts a charge: no instance, volume,
+snapshot, backup or reserved IP is made, nothing resized, restored or destroyed. A stopped instance still bills: Vultr's
+docs say stopping an instance does not halt billing, only destroying it does.
 
 Its settings are pairs asked of the login of the app it is attached to (settings.py: VULTR_API_KEY, VULTR_DDNS_HOSTS,
 VULTR_DDNS_MINUTES), never a file of its own. A Vultr API key answers only from the addresses its Access Control allows
-(Vultr's console: Account > API > Access Control). While attached to the platform app it reads the account every quarter
-of an hour and checks the Dynamic DNS hosts every few minutes, in a thread of its own; detached, nothing of it runs. Its
+(Vultr's console: Account > API > Access Control). While attached to the platform app, and set up, it reads the account
+every quarter of an hour and checks the Dynamic DNS hosts every few minutes, in a thread of its own; attached by any other
+app (the charts app run alone), not set up, or detached, nothing of it runs. Its
 status is what was read last (no request is made to answer it): the platform's page draws its tables, its actions
 (Refresh, Update DNS now) and its forms.
 
     python -m plugin_platform_vultr status | account | servers | domains | records DOMAIN | firewalls | keys | ddns [--now]
-        | power NAME on|off|reboot | set DOMAIN NAME TYPE DATA [--ttl N] [--priority N] | remove DOMAIN NAME TYPE [DATA]
+        | power NAME on|off|reboot | set DOMAIN NAME TYPE DATA [--ttl N] | add DOMAIN NAME TYPE DATA [--ttl N] [--priority N]
+        | remove DOMAIN NAME TYPE [DATA]
 """
 from __future__ import annotations
 
+import json
+import os
 import re
 import threading
 import time
+from pathlib import Path
 
 from liminal_libs.machines import ddns as keeping
 from liminal_libs.machines.plugin import MachinePlugin
@@ -38,7 +45,7 @@ from .card import APIS, VULTR_API
 from .records import TYPES, Refusal
 from .settings import ACCESS_CONTROL, API_KEY, CONSOLE_API, DDNS_HOSTS, KEYS, NAMES, WHERE_KEY, Config
 
-__version__ = "0.1.0"
+__version__ = "0.1.1"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -51,6 +58,10 @@ DDNS_TTL = 300  # the TTL of an A record Dynamic DNS makes (the reference's exam
 ACCEPT_HALT = "accept_halt"  # the halt's argument accepting it (Refusal's accept): the page's second confirmation
 ACCEPT_REBOOT = "accept_reboot"  # the reboot's (a hard reboot: asked twice, as a halt is)
 ACCEPT_RISK = walls.ACCEPT  # a risky firewall rule change's
+ACCEPT_REPLACE = "accept_replace"  # a record set removing the host's other records of its type
+DIR_VAR = "LIMINAL_PLATFORM_DIR"  # the platform's own folder: Dynamic DNS's state goes under it
+TRANSIENT_RETRY_S = 120.0  # a read that did not get through (no answer, a 429, a 5xx) tried again after this long
+HIDDEN = ("kvm", "default_password")  # never handed on: an instance's console link (a token in it), a password
 PUBLIC_IPV4 = (("myip.opendns.com", "a", "208.67.222.222", "OpenDNS"),  # this network's address, asked of these servers
                ("o-o.myaddr.l.google.com", "txt", "216.239.32.10", "Google"))
 STOPPED_BILLS = ("a stopped (halted) instance still bills: Vultr's docs say stopping an instance does not halt billing; "
@@ -122,6 +133,28 @@ def an_id(value, what: str) -> str:
     return t
 
 
+def platform_dir() -> Path:
+    """The platform's own folder (LIMINAL_PLATFORM_DIR, else the data folder's platform/)."""
+    named = (os.environ.get(DIR_VAR) or "").strip()
+    if named:
+        return Path(named).expanduser()
+    from liminal_libs import layout
+
+    return layout.data_dir() / "platform"
+
+
+def public_view(inst: dict) -> dict:
+    """An instance as the plugin hands it on: without its console link (a token in its query) nor a password."""
+    return {k: v for k, v in inst.items() if k not in HIDDEN}
+
+
+def transient(e: Exception) -> bool:
+    """A trouble that is no refusal: no answer came back, Vultr's rate limit, Vultr's own failure (tried again soon; the
+    plugin stays valid)."""
+    status = getattr(e, "status", None)
+    return isinstance(status, int) and (status == 0 or status == 429 or status >= 500)
+
+
 class _Runtime:
     """What the plugin read and holds, shared by its copies (the registry's with_ makes them)."""
 
@@ -146,6 +179,9 @@ class _Runtime:
         self.api_error = ""
         self.api_error_at: float | None = None
         self.api_print = ""  # the settings that outcome is of
+        self.trouble = ""  # the last read that did not get through (no refusal: tried again soon), and when
+        self.trouble_at: float | None = None
+        self.ctx = threading.local()  # the worker thread's: its stop event (config() and client() refuse once it is set)
         self.keeper: keeping.Keeper | None = None
         self.ddns_print = ""
         self.ddns_at: float | None = None
@@ -167,16 +203,18 @@ class VultrPlugin(MachinePlugin):
     order = 762
     ICON = "vultr"  # Vultr's V (liminal-libs 1.49.0's icons.js)
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "balance", "servers", "domains", "records", "firewalls", "ssh_keys",
-             "start", "reboot", "halt", "set_record", "remove_record", "add_rule", "remove_rule", "add_key", "remove_key",
-             "ddns_update")
+             "start", "reboot", "halt", "set_record", "add_record", "remove_record", "add_rule", "remove_rule", "add_key",
+             "remove_key", "ddns_update", "ddns_take_over")
     keys = KEYS
     signup = CONSOLE_API
     limits = f"Vultr's API: {RATE} (429 and Retry-After beyond); the plugin keeps to ten a second"
     apis = APIS
 
-    def __init__(self, transport=None, public=None, clock=None, sleep=None, gap: float | None = None):
+    def __init__(self, transport=None, public=None, clock=None, sleep=None, gap: float | None = None,
+                 folder: Path | None = None):
         self._transport = transport  # RestClient's (method, url, headers, body, timeout) -> (status, headers, body): a test's
         self._public = public  # () -> (address, whose): a test's; else this network's address asked of PUBLIC_IPV4
+        self._folder = Path(folder) if folder is not None else None  # its own folder (a test's): Dynamic DNS's state
         self._clock = clock or time.time
         self._sleep = sleep or time.sleep
         self._gap = gap
@@ -184,7 +222,11 @@ class VultrPlugin(MachinePlugin):
 
     # -- the settings, the API, the keeper -----------------------------------------------------------------------------------
     def config(self, fresh: bool = False) -> Config:
-        """The settings, asked of the login (the attached app's, else the environment's); kept CONFIG_S."""
+        """The settings, asked of the login (the attached app's, else the environment's); kept CONFIG_S. In the
+        background's thread once it was told to stop (the plugin detached): refused, nothing read."""
+        stop = getattr(self._rt.ctx, "stop", None)
+        if stop is not None and stop.is_set():
+            raise RuntimeError("the plugin was detached: nothing more is read or sent")
         now = time.monotonic()
         with self._rt.lock:
             kept = self._rt.config
@@ -196,9 +238,12 @@ class VultrPlugin(MachinePlugin):
         return cfg
 
     def settings_changed(self) -> None:
-        """Its settings were just entered (the platform's Settings…, kept through its login): read anew at once."""
+        """Its settings were just entered (the platform's Settings…, kept through its login): read anew at once; the
+        background started now if the platform holds it and it is set up now, or woken."""
         with self._rt.lock:
             self._rt.config = None
+        self._maybe_start()
+        self._rt.wake.set()
 
     def client(self) -> VultrApi:
         """The API with the key as it is set (ValueError when it is not)."""
@@ -215,12 +260,16 @@ class VultrPlugin(MachinePlugin):
             self._rt.api = (cfg.api_print, made)
         return made
 
+    def ddns_file(self) -> Path:
+        """Where Dynamic DNS keeps what is its own and what it was let take over: the platform's folder's vultr/ddns.json."""
+        return (self._folder if self._folder is not None else platform_dir() / self.name) / "ddns.json"
+
     def keeper(self) -> keeping.Keeper:
-        """Dynamic DNS's keeper: a host's A record read and set through Vultr's DNS."""
+        """Dynamic DNS's keeper: a host's A record read and set through Vultr's DNS, only where it is its own."""
         with self._rt.lock:
             if self._rt.keeper is None:
                 self._rt.keeper = keeping.Keeper(read=self._ddns_read, write=self._ddns_write, servers=PUBLIC_IPV4,
-                                                 public=self._public, clock=self._clock)
+                                                 public=self._public, clock=self._clock, state=self.ddns_file())
             return self._rt.keeper
 
     def known(self) -> list[str]:
@@ -245,12 +294,17 @@ class VultrPlugin(MachinePlugin):
         finally:
             self._rt.refreshing.release()
 
-    def _refresh(self, cfg: Config) -> dict:
+    def _refresh(self, cfg: Config, api: VultrApi | None = None) -> dict:
         now = self._clock()
         got: dict[str, object] = {}
         why: dict[str, str] = {}
 
+        def stopped() -> None:
+            if self._stopping():  # the background's refresh, the plugin detached meanwhile: nothing more read
+                raise RuntimeError("the plugin was detached: the refresh ends here")
+
         def part(name, read):
+            stopped()
             try:
                 got[name] = read()
             except RestError as e:
@@ -261,6 +315,7 @@ class VultrPlugin(MachinePlugin):
         def each(found, key, read, most, words):
             out: dict[str, tuple | str] = {}
             for i, item in enumerate(found or []):
+                stopped()
                 k = str(item.get(key) or "")
                 if not k:
                     continue
@@ -276,7 +331,7 @@ class VultrPlugin(MachinePlugin):
             return out
 
         try:
-            api = self.client()
+            api = api or self.client()
             part("account", api.account)
             part("instances", api.instances)
             self._prices(api, got.get("instances") or [], now)
@@ -291,6 +346,7 @@ class VultrPlugin(MachinePlugin):
             part("reserved", api.reserved_ips)
             counts: dict[str, int | str] = {}
             for name, items, title, paged in COUNTED:
+                stopped()
                 try:
                     counts[title] = api.count(name, items, paged)
                 except RestError as e:
@@ -301,13 +357,17 @@ class VultrPlugin(MachinePlugin):
                 raise RestError("every part was refused: " + "; ".join(f"{k}: {v}" for k, v in why.items()))
         except (RestError, ValueError) as e:
             with self._rt.lock:
-                self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = False, str(e), now, cfg.api_print
+                if transient(e):  # no answer, the rate limit, Vultr's own failure: no refusal of the key (tried again soon)
+                    self._rt.trouble, self._rt.trouble_at = str(e), now
+                else:
+                    self._rt.api_ok, self._rt.api_error, self._rt.api_error_at, self._rt.api_print = False, str(e), now, cfg.api_print
             raise
         with self._rt.lock:
             rt = self._rt
             rt.read, rt.why, rt.zones, rt.rules, rt.counts, rt.refreshed_at = got, why, read_zones, read_rules, counts, now
             rt.notes = {}
             rt.api_ok, rt.api_error, rt.api_error_at, rt.api_print = True, "", None, cfg.api_print
+            rt.trouble, rt.trouble_at = "", None
         return {"instances": len(got.get("instances") or []), "domains": len(got.get("domains") or []),
                 "groups": len(got.get("groups") or []), "notRead": sorted(why), "refreshedAt": when(now)}
 
@@ -358,7 +418,7 @@ class VultrPlugin(MachinePlugin):
         self._prices(api, found, self._clock())
         with self._rt.lock:
             self._rt.read["instances"] = found
-        return [{**i, "price": self._price(i)} for i in found]
+        return [{**public_view(i), "price": self._price(i)} for i in found]
 
     def domains(self) -> list[dict]:
         """The domains on Vultr's DNS, read now."""
@@ -408,20 +468,24 @@ class VultrPlugin(MachinePlugin):
     def reboot(self, instance: str, label: str = "", accept_reboot: bool = False) -> dict:
         """An instance rebooted (it was running): a hard reboot, Vultr's docs say, so refused until accepted a second time
         (accept_reboot), as a halt is."""
-        return self._power("reboot", instance, label, bool(accept_reboot))
+        return self._power("reboot", instance, label, accept_reboot is True)
 
     def halt(self, instance: str, label: str = "", accept_halt: bool = False) -> dict:
         """An instance halted (powered off; still billed): refused until accepted a second time (accept_halt)."""
-        return self._power("halt", instance, label, bool(accept_halt))
+        return self._power("halt", instance, label, accept_halt is True)
 
     def _power(self, action: str, instance: str, label: str = "", accepted: bool = False) -> dict:
+        """A power change, once the instance read afresh is the one shown (`label`, needed), active and in the state the
+        change is for; a reboot and a halt only once accepted a second time (`accepted`: True itself)."""
         iid = an_id(instance, "an instance")
+        if not str(label or "").strip():
+            raise ValueError("an instance is named by its ID and by its name as the page shows it (its label)")
         api = self.client()
         now = api.instance(iid)
         if not now:
             raise Refusal(f"this account has no instance {iid}")
         shown = name_of(now)
-        if label and label != shown:
+        if label != shown:
             raise Refusal(f"instance {iid} is {shown} now, not {label}: nothing asked (the page shows it as read now)")
         power, status = str(now.get("power_status") or ""), str(now.get("status") or "")
         if status != "active":
@@ -430,10 +494,10 @@ class VultrPlugin(MachinePlugin):
             raise Refusal(f"{shown} is running already")
         if action in ("reboot", "halt") and power != "running":
             raise Refusal(f"{shown} is {power or 'not running'}: there is nothing to {action}")
-        if action == "halt" and not accepted:
+        if action == "halt" and accepted is not True:
             raise Refusal(f"{shown} is halted only once that is accepted a second time ({ACCEPT_HALT}). "
                           + HALT_WORDS.format(label=shown), accept=ACCEPT_HALT)
-        if action == "reboot" and not accepted:
+        if action == "reboot" and accepted is not True:
             raise Refusal(f"{shown} is rebooted only once that is accepted a second time ({ACCEPT_REBOOT}). "
                           + REBOOT_ACCEPT_WORDS.format(label=shown), accept=ACCEPT_REBOOT)
         api.power(action, iid)
@@ -473,22 +537,44 @@ class VultrPlugin(MachinePlugin):
             raise Refusal(f"{d} is not on this account's Vultr DNS")
         return d
 
-    def set_record(self, domain: str, name: str, rtype: str, data: str, ttl=None, priority=None) -> dict:
-        """A record set in `domain` (records.plan_set), every other record kept; the zone read before and after."""
+    def set_record(self, domain: str, name: str, rtype: str, data: str, ttl=None, accept_replace: bool = False) -> dict:
+        """A record set in `domain` (records.plan_set: an A, AAAA or CNAME), replacing the host's records of its type: one
+        updated, any others removed only once that is accepted a second time (accept_replace, True itself); every other
+        record of the domain kept; the zone read before and after."""
         d = self._known_domain(domain)
         api = self.client()
         held = zones.records_of(api.records(d), d)
-        plan = zones.plan_set(held, d, name, rtype, data, ttl=ttl, priority=priority)
+        plan = zones.plan_set(held, d, name, rtype, data, ttl=ttl)
+        if plan.removes and accept_replace is not True:
+            host = zones.relative(name, d) or "@"
+            raise Refusal(f"{host} holds {len(plan.removes) + 1} {str(rtype).strip().upper()} records: setting it to "
+                          f"{data} replaces them all, so {', '.join(r.data for r in plan.removes)} "
+                          f"{'is' if len(plan.removes) == 1 else 'are'} removed. Nothing was sent: it is done only once "
+                          f"that is accepted ({ACCEPT_REPLACE}); to keep them, Add a record… adds one beside them",
+                          accept=ACCEPT_REPLACE)
+        return self._applied(d, plan, held, name, rtype, api)
+
+    def add_record(self, domain: str, name: str, rtype: str, data: str, ttl=None, priority=None) -> dict:
+        """A record added to `domain` beside the host's others (records.plan_add: every type but CNAME), every other
+        record kept; the zone read before and after."""
+        d = self._known_domain(domain)
+        api = self.client()
+        held = zones.records_of(api.records(d), d)
+        plan = zones.plan_add(held, d, name, rtype, data, ttl=ttl, priority=priority)
+        return self._applied(d, plan, held, name, rtype, api)
+
+    def _applied(self, d: str, plan, held, name: str, rtype: str, api: VultrApi) -> dict:
         report, after = zones.apply(api, plan)
         self._keep_zone(d, after if after is not None else held)
         host = zones.relative(name, d)
         if plan.ops and str(rtype).strip().upper() == "A" and self._ddns_host(d, host):
-            report["lines"].append(f"{host or '@'}.{d} is a Dynamic DNS host ({DDNS_HOSTS}): its next check sets its A "
-                                   "record back to this network's address")
+            report["lines"].append(f"{host or '@'}.{d} is one of {DDNS_HOSTS}: Dynamic DNS keeps it only while it points "
+                                   "at this network's address alone, or once you take it over")
         return report
 
     def remove_record(self, domain: str, record: str, name: str = "", rtype: str = "", data: str = "") -> dict:
-        """A record removed from `domain` by its ID, once it is checked to be the one shown (`name`, `rtype`, `data`)."""
+        """A record removed from `domain` by its ID, once it is checked to be the one shown (`name`, `rtype` and `data`,
+        all three needed)."""
         d = self._known_domain(domain)
         api = self.client()
         held = zones.records_of(api.records(d), d)
@@ -526,7 +612,7 @@ class VultrPlugin(MachinePlugin):
         if isinstance(most, int) and most and len(held) >= most:
             raise Refusal(f"the group holds {len(held)} rules, its most ({most}): remove one first")
         risk = walls.risk_of_adding(new, held, linked)
-        walls.refuse_risky(risk, bool(accept_risk))
+        walls.refuse_risky(risk, accept_risk)
         made = api.create_rule(gid, body)
         title = str(g.get("description") or gid)
         lines = [f"sent: POST /firewalls/{gid}/rules " + ", ".join(f"{k} {v}" for k, v in body.items())]
@@ -556,13 +642,15 @@ class VultrPlugin(MachinePlugin):
         found = next((r for r in held if r.id == rid), None)
         if found is None:
             raise Refusal(f"the group holds no rule {rid} any more: nothing removed (the page shows it as read now)")
+        if any(x in (None, "") for x in (protocol, port, source)):
+            raise ValueError("a rule is removed by its ID with its protocol, port and source as shown (all three)")
         differs = [w for w, given, now in (("protocol", protocol, found.protocol.upper()), ("port", port, found.port_words()),
                                            ("from", source, found.from_words()))
-                   if given not in (None, "") and str(given).strip().lower() != now.lower()]
+                   if str(given).strip().lower() != now.lower()]
         if differs:
             raise Refusal(f"rule {rid} is {found.said()} now, not the one shown ({', '.join(differs)} differ): nothing removed")
         risk = walls.risk_of_removing(found, held, linked)
-        walls.refuse_risky(risk, bool(accept_risk))
+        walls.refuse_risky(risk, accept_risk)
         api.delete_rule(gid, found.id)
         title = str(g.get("description") or gid)
         report = {"said": f"removed {found.said()} from {title}", "group": gid, "rule": found.id,
@@ -593,14 +681,16 @@ class VultrPlugin(MachinePlugin):
         return self._keys_after(api, report, lambda found: any(sshkeys.same_key(k.get("ssh_key") or "", key) for k in found))
 
     def remove_key(self, key: str, name: str = "") -> dict:
-        """An SSH key removed from the account by its ID, once it is checked to be the one shown (`name`)."""
+        """An SSH key removed from the account by its ID, once it is checked to be the one shown (`name`, needed)."""
         kid = an_id(key, "an SSH key")
+        if not str(name or "").strip():
+            raise ValueError("an SSH key is removed by its ID with its name as shown")
         api = self.client()
         held = api.ssh_keys()
         found = next((k for k in held if str(k.get("id")) == kid), None)
         if found is None:
             raise Refusal(f"the account holds no SSH key {kid} any more: nothing removed")
-        if name and name != str(found.get("name") or ""):
+        if name != str(found.get("name") or ""):
             raise Refusal(f"SSH key {kid} is named {found.get('name')} now, not {name}: nothing removed")
         api.delete_key(kid)
         report = {"said": f"removed the key {found.get('name') or kid}", "key": kid,
@@ -632,10 +722,11 @@ class VultrPlugin(MachinePlugin):
     def _at(h: keeping.Host) -> str:
         return "" if h.name == "@" else h.name
 
-    def _held(self, h: keeping.Host) -> list:
+    def _held(self, h: keeping.Host, api: VultrApi | None = None) -> list:
         """The host's records as Vultr's DNS holds them now (a CNAME there refused: an A record cannot stand beside it)."""
         rel = self._at(h)
-        found = [r for r in zones.records_of(self.client().records(h.zone, name=rel), h.zone) if r.name == rel]
+        api = api or self.client()
+        found = [r for r in zones.records_of(api.records(h.zone, name=rel), h.zone) if r.name == rel]
         if any(r.type == "CNAME" for r in found):
             raise ValueError(f"{h.fqdn} is a CNAME: Dynamic DNS keeps an A record, which cannot stand beside it")
         return [r for r in found if r.type == "A"]
@@ -643,9 +734,18 @@ class VultrPlugin(MachinePlugin):
     def _ddns_read(self, h: keeping.Host) -> list[str]:
         return [r.data for r in self._held(h)]
 
+    def _stopping(self) -> bool:
+        stop = getattr(self._rt.ctx, "stop", None)
+        return stop is not None and stop.is_set()
+
     def _ddns_write(self, h: keeping.Host, ip: str) -> str:
+        """The host's A record set to exactly `ip` (the keeper asks it only of a host that is its own or taken over): made
+        where there is none, else its first updated and, for a host taken over that held several, the others removed
+        (its confirmation said what it holds is dropped). The background's stop is heeded before each request."""
         api = self.client()
-        held = self._held(h)
+        held = self._held(h, api)
+        if self._stopping():
+            raise RuntimeError("the plugin was detached: nothing written")
         if not held:
             api.create_record(h.zone, {"name": self._at(h), "type": "A", "data": ip, "ttl": DDNS_TTL})
             return "made"
@@ -655,8 +755,10 @@ class VultrPlugin(MachinePlugin):
         if first.data != ip:
             api.update_record(h.zone, first.id, {"data": ip})
         for r in rest:
+            if self._stopping():
+                raise RuntimeError("the plugin was detached: the rest not written")
             api.delete_record(h.zone, r.id)
-        return "set" + (f" (its other A records removed: {', '.join(r.data for r in rest)})" if rest else "")
+        return "set" + (f" (the other addresses it held dropped: {', '.join(r.data for r in rest)})" if rest else "")
 
     def ddns_hosts(self, cfg: Config | None = None, fetch: bool = False) -> tuple[list, list[str]]:
         """The Dynamic DNS hosts set, split against the account's domains (read now when none is known and `fetch`), and
@@ -669,32 +771,88 @@ class VultrPlugin(MachinePlugin):
                 pass  # said by each host as it is checked
         return keeping.hosts_of(cfg.hosts, self.known())
 
-    def ddns_update(self, force: bool = True) -> list[dict]:
-        """A Dynamic DNS pass now (the page's Update DNS now: `force`, each host's record set whether it differs or not;
-        the command line's `ddns` without --now sets only where it differs)."""
+    def _let_go_removed(self, cfg: Config) -> list[str]:
+        """The hosts the keeper holds (in this run, or in its state file) that are no longer in the settings, let go of:
+        neither its own nor taken over any more. Their names, in order."""
+        wanted = set()
+        for part in cfg.hosts.replace(";", ",").replace(" ", ",").split(","):
+            n = part.strip().rstrip(".").lower()
+            if n:
+                wanted.add(n[2:] if n.startswith("@.") else n)
+        keeper = self.keeper()
+        held = {s.fqdn for s in keeper.states()}
+        try:
+            data = json.loads(self.ddns_file().read_text(encoding="utf-8"))
+            held |= {str(k).lower() for k in (data.get("own") or {})} | {str(k).lower() for k in (data.get("taken") or [])}
+        except (OSError, ValueError, AttributeError):
+            pass
+        gone = sorted(h for h in held if h not in wanted)
+        for fqdn in gone:
+            keeper.let_go(fqdn)
+        return gone
+
+    def _ddns_pass(self, cfg: Config, hosts: list, force: bool = False, wait: float = 120.0, stop=None) -> list[dict]:
+        self._let_go_removed(cfg)
+        out = self.keeper().run_pass(hosts, force=bool(force), wait=wait, stop=stop)
+        with self._rt.lock:
+            self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
+        return out
+
+    def ddns_update(self, force: bool = True) -> dict:
+        """A Dynamic DNS pass now (the page's confirmed Update DNS now: `force`, each host that is its own set whether it
+        differs or not; the command line's `ddns` without --now sets only where it differs). A host holding another
+        address is left as it is (Take over… on the page). Its answer: said, lines and each host's state (`hosts`)."""
         cfg = self.config(fresh=True)
         if not cfg.ddns_ready:
             raise ValueError("Dynamic DNS is not set up: " + ("; ".join(cfg.incomplete) or f"{DDNS_HOSTS} is not set"))
         hosts, wrong = self.ddns_hosts(cfg, fetch=True)
         if not hosts:
             raise ValueError(f"no host of {DDNS_HOSTS} is in this account's Vultr DNS: " + ("; ".join(wrong) or "none set"))
-        out = self.keeper().run_pass(hosts, force=bool(force))
-        with self._rt.lock:
-            self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
-        return out
+        out = self._ddns_pass(cfg, hosts, force=force)
+        current = sum(1 for h in out if h.get("ok"))
+        return {"said": f"Dynamic DNS: {current} of {plural(len(out), 'host')} current", "ok": current == len(out),
+                "lines": [f"{h['host']}: {h['result']}" for h in out] + [f"not kept: {w}" for w in wrong], "hosts": out}
+
+    def ddns_take_over(self, host: str, holds=None) -> dict:
+        """A host let be taken over (the page's Take over…, once confirmed: its confirmation named what the record holds
+        and that it will point here), then a pass for it: its A record set to this network's address alone. Refused when
+        it is none of the hosts set, or holds now what the page did not show (`holds`)."""
+        cfg = self.config(fresh=True)
+        if not cfg.ddns_ready:
+            raise ValueError("Dynamic DNS is not set up: " + ("; ".join(cfg.incomplete) or f"{DDNS_HOSTS} is not set"))
+        hosts, _ = self.ddns_hosts(cfg, fetch=True)
+        name = str(host or "").strip().rstrip(".").lower()
+        h = next((x for x in hosts if x.fqdn == name), None)
+        if h is None:
+            raise Refusal(f"{host} is none of {DDNS_HOSTS} in this account's Vultr DNS: nothing taken over")
+        now = self._ddns_read(h)
+        if holds is not None:
+            shown = sorted(a.strip() for a in str(holds).split(",") if a.strip())
+            if shown != sorted(now):
+                raise Refusal(f"{h.fqdn} holds {', '.join(now) or 'no A record'} now, not {holds}: nothing taken over (the "
+                              "page shows it as read now)")
+        keeper = self.keeper()
+        keeper.take_over(h.fqdn)
+        out = self._ddns_pass(cfg, [h], force=False)
+        st = out[0] if out else {"result": "not checked", "ok": None}
+        return {"said": f"{h.fqdn} taken over: {st['result']}", "ok": st.get("ok"), "host": h.fqdn,
+                "lines": [f"it held {', '.join(now) or 'no A record'}; Dynamic DNS keeps it at this network's address from "
+                          "now on"]}
 
     # -- attached: the reading in the background ---------------------------------------------------------------------------
     def attach(self, app, login=None) -> dict:
-        """Attached by the platform: its settings asked of the platform's login from now on; the account read and the
-        Dynamic DNS hosts checked in the background."""
+        """Attached: its settings asked of the app's login from now on. Attached by the platform, and set up: the account
+        read and the Dynamic DNS hosts checked in the background (attached by any other app, the charts app run alone,
+        nothing of it runs)."""
         interface = super().attach(app, login)
         with self._rt.lock:
             self._rt.config = None
-        self._start()
+        self._maybe_start()
         return interface
 
     def detach(self) -> None:
-        """Detached (the platform ending, the plugin disabled or not valid): the background reading ends."""
+        """Detached (the platform ending, the plugin disabled or not valid): the background reading ends, and a pass
+        under way writes nothing more."""
         self._stop()
         super().detach()
         with self._rt.lock:
@@ -705,6 +863,17 @@ class VultrPlugin(MachinePlugin):
         with self._rt.lock:
             t = self._rt.worker
         return t is not None and t.is_alive()
+
+    def _maybe_start(self) -> None:
+        """The background started when the platform holds the plugin (its app's NAME) and it is set up."""
+        if getattr(self.app, "NAME", "") != "platform":
+            return
+        try:
+            ready = self.config().api_ready
+        except Exception:  # noqa: BLE001 - its settings not to be read: nothing started
+            return
+        if ready:
+            self._start()
 
     def _start(self) -> None:
         with self._rt.lock:
@@ -727,21 +896,26 @@ class VultrPlugin(MachinePlugin):
             t.join(timeout=10)
 
     def _work(self, stop: threading.Event) -> None:
-        """The background: the account read every REFRESH_S, the Dynamic DNS hosts checked every VULTR_DDNS_MINUTES;
-        nothing done for what is not set."""
+        """The background: the account read every REFRESH_S (a read that did not get through, again after
+        TRANSIENT_RETRY_S), the Dynamic DNS hosts checked every VULTR_DDNS_MINUTES. It ends once stopped (nothing read or
+        written after that: config() refuses in this thread) or once the key is no longer set."""
+        self._rt.ctx.stop = stop
         next_api = next_ddns = 0.0
         while not stop.is_set():
             now = time.monotonic()
             cfg = None
             try:
                 cfg = self.config()
-                if cfg.api_ready and now >= next_api:
+                if not cfg.api_ready:
+                    break  # not set up any more: nothing runs (settings_changed starts it again)
+                if now >= next_api:
                     next_api = now + REFRESH_S
                     if self._rt.refreshing.acquire(blocking=False):  # Refresh asked meanwhile: that one is enough
                         try:
                             self._refresh(cfg)
-                        except Exception:  # noqa: BLE001 - kept as its outcome (api_error), shown by the status
-                            pass
+                        except Exception as e:  # noqa: BLE001 - kept as its outcome, shown by the status
+                            if transient(e):
+                                next_api = now + TRANSIENT_RETRY_S
                         finally:
                             self._rt.refreshing.release()
                 if cfg.ddns_ready and now >= next_ddns and not stop.is_set():
@@ -749,9 +923,7 @@ class VultrPlugin(MachinePlugin):
                     try:
                         hosts, _ = self.ddns_hosts(cfg)
                         if hosts:
-                            self.keeper().run_pass(hosts, force=False, wait=0.5)
-                        with self._rt.lock:
-                            self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
+                            self._ddns_pass(cfg, hosts, force=False, wait=0.5, stop=stop)
                     except Exception:  # noqa: BLE001 - a pass under way (Update DNS now), or its trouble kept by the hosts
                         pass
             except Exception:  # noqa: BLE001 - the background never ends on a trouble; the status says it
@@ -806,6 +978,7 @@ class VultrPlugin(MachinePlugin):
             read_zones, read_rules, counts, notes = dict(rt.zones), dict(rt.rules), dict(rt.counts), dict(rt.notes)
             regions = dict(rt.regions)
             refreshed_at, api_ok, api_error, api_error_at = rt.refreshed_at, rt.api_ok, rt.api_error, rt.api_error_at
+            trouble, trouble_at = rt.trouble, rt.trouble_at
             api_print, ddns_print, keeper = rt.api_print, rt.ddns_print, rt.keeper
         works = None
         if cfg.api_ready:
@@ -818,7 +991,9 @@ class VultrPlugin(MachinePlugin):
         states = {s.fqdn: s for s in (keeper.states() if keeper is not None else [])}
         failing = [f"{s.fqdn}: {s.result}" for h in hosts for s in [states.get(h.fqdn)] if s is not None and s.ok is False
                    and ddns_print == cfg.ddns_print]
-        notes_words = [*cfg.incomplete, *cfg.problems, *wrong, *(f"Dynamic DNS: {f}" for f in failing),
+        notes_words = [*([f"the last read did not get through ({when(trouble_at)}): {trouble}; tried again in a few minutes"]
+                         if trouble and works is not False else []),
+                       *cfg.incomplete, *cfg.problems, *wrong, *(f"Dynamic DNS: {f}" for f in failing),
                        *(f"{k} not read: {v}" for k, v in sorted(why.items()))]
         valid = cfg.api_ready and works is not False
         out: dict = {"present": True, "valid": valid,
@@ -861,11 +1036,11 @@ class VultrPlugin(MachinePlugin):
             out["ddnsEvery"] = f"every {cfg.minutes:g} min" + ("" if attached else ", once attached")
         out["tables"] = self._tables(cfg, read, why, read_zones, read_rules, counts, notes, regions, hosts, wrong, public)
         out["forms"] = self._forms(cfg, read, read_zones, read_rules, public) if cfg.api_ready and works is not False else []
+        if cfg.ddns_ready and works is not False:
+            out["forms"] += [self.keeper().take_form(), self.keeper().now_form()]
         out["actions"] = ([{"hook": "refresh", "args": [], "title": "Refresh",
                             "note": "the account read again now (a few dozen requests at most)"}] if cfg.api_ready else []) + \
-                         ([{"hook": "ddns_update", "args": [], "title": "Update DNS now",
-                            "note": "each Dynamic DNS host's A record set now to this network's address"}]
-                          if cfg.ddns_ready else [])
+                         ([{"form": keeping.NOW_FORM, "title": "Update DNS now"}] if cfg.ddns_ready and works is not False else [])
         return out
 
     def _summary(self, cfg, works, api_error, read, hosts, states, attached) -> str:
@@ -899,11 +1074,11 @@ class VultrPlugin(MachinePlugin):
     def _tables(self, cfg, read, why, read_zones, read_rules, counts, notes, regions, hosts, wrong, public) -> list[dict]:
         out = []
         if cfg.ddns_ready:
-            t = self.keeper().table(hosts, cfg.minutes, attached=self.app is not None, when=when)
+            t = self.keeper().table(hosts, cfg.minutes, attached=self.app is not None, when=when, take=True,
+                                    empty=None if self.known() else "The hosts are matched to the account's domains once "
+                                                                    "they are read.")
             if wrong:
                 t["note"] += " · not kept: " + "; ".join(wrong)
-            if not self.known():
-                t["empty"] = "The hosts are matched to the account's domains once they are read."
             out.append(t)
         if not cfg.api_ready:
             return out
@@ -1032,14 +1207,17 @@ class VultrPlugin(MachinePlugin):
                              str(r.priority) if r.type in zones.PRIORITY else "",
                              {"form": f"remove:{name}", "title": "Remove…", "label": f"Remove {r.host} {r.type} {short}",
                               "values": {"record": r.id, "name": r.host, "rtype": r.type, "data": r.data}}])
-            note = ("set and removed here or from the command line (python -m plugin_platform_vultr set | remove): one "
-                    "record at a time, every other record kept; read before and after each change")
+            note = ("Set a record… replaces the host's A, AAAA or CNAME records (asked again before any other goes); "
+                    "Add a record… adds one beside the others, all kept; Remove… takes one away. The zone is read before "
+                    "and after each change (the command line too: python -m plugin_platform_vultr set | add | remove)")
             if kept:
                 note += f" · Dynamic DNS keeps {', '.join(kept)} at this network's address"
             out.append({"title": f"{name} records", "note": note,
                         "columns": [{"title": "Name"}, {"title": "Type"}, {"title": "Data"}, {"title": "TTL", "num": True},
                                     {"title": "Priority", "num": True}, {"title": ""}],
-                        "rows": rows, "empty": "No records.", "actions": [{"form": f"set:{name}", "title": "Set a record…"}]})
+                        "rows": rows, "empty": "No records.",
+                        "actions": [{"form": f"set:{name}", "title": "Set a record…"},
+                                    {"form": f"add:{name}", "title": "Add a record…"}]})
         return out
 
     def _firewall_tables(self, groups, why, read_rules, instances) -> list[dict]:
@@ -1115,32 +1293,52 @@ class VultrPlugin(MachinePlugin):
             if not isinstance(read_zones[name], tuple):
                 continue
             domain = {"name": "domain", "label": "Domain", "type": "fixed", "value": name}
-            kept = "Every other record is kept: one record is changed at a time, the zone read before and after."
+            ttl = {"name": "ttl", "label": "TTL (seconds)", "type": "number", "min": zones.TTL_MIN, "placeholder": "300",
+                   "empty": "the record's own, else Vultr's"}
+            host = {"name": "name", "label": "Name", "type": "text", "required": True, "placeholder": "@, www, home",
+                    "note": f"@ is {name} itself; home is home.{name}"}
             out += [
                 {"id": f"set:{name}", "hook": "set_record", "title": f"Set a record in {name}",
-                 "note": "An A, AAAA or CNAME replaces the host's records of its type; the other types are added beside "
-                         "the host's others.",
-                 "fields": [domain,
-                            {"name": "name", "label": "Name", "type": "text", "required": True, "placeholder": "@, www, home",
-                             "note": f"@ is {name} itself; home is home.{name}"},
+                 "note": "Sets the host's A, AAAA or CNAME record: it replaces the host's records of that type. To add an "
+                         "address beside the ones there, Add a record….",
+                 "fields": [domain, host,
                             {"name": "rtype", "label": "Type", "type": "choice", "value": "A",
-                             "choices": [{"value": t, "title": t, "note": TYPES[t]} for t in TYPES]},
+                             "choices": [{"value": t, "title": t, "note": n} for t, n in zones.SET_TYPES.items()]},
                             {"name": "data", "label": "Data", "type": "text", "required": True,
-                             "placeholder": public or "an address, a host name or text, as its type says",
+                             "placeholder": public or "an address, or a host name for a CNAME"},
+                            ttl,
+                            {"name": ACCEPT_REPLACE, "type": "accept", "title": "Replace them?", "yes": "Replace them",
+                             "words": ("Setting {name} {rtype} to {data} removes the host's other {rtype} records the "
+                                       "refusal above names: they stop answering for {name}. Add a record… would add one "
+                                       "beside them instead.")}],
+                 "submit": "Review the change",
+                 "confirm": {"title": f"Set this record in {name}?",
+                             "words": "{name} {rtype} is set to {data} in {domain}: it replaces the host's {rtype} records "
+                                      "(one updated to {data}; you are asked again before any other is removed). Every "
+                                      "record of another host or another type is kept.",
+                             "yes": "Set the record"}},
+                {"id": f"add:{name}", "hook": "add_record", "title": f"Add a record to {name}",
+                 "note": "Adds a record beside the host's others: every other record is kept.",
+                 "fields": [domain, host,
+                            {"name": "rtype", "label": "Type", "type": "choice", "value": "TXT",
+                             "choices": [{"value": t, "title": t, "note": n} for t, n in zones.ADD_TYPES.items()]},
+                            {"name": "data", "label": "Data", "type": "text", "required": True,
+                             "placeholder": "an address, a host name or text, as its type says",
                              "note": "TXT text is sent in double quotes, as Vultr's DNS keeps it"},
-                            {"name": "ttl", "label": "TTL (seconds)", "type": "number", "min": zones.TTL_MIN,
-                             "placeholder": "300", "empty": "the record's own, else Vultr's"},
+                            ttl,
                             {"name": "priority", "label": "Priority", "type": "number", "min": 0, "max": 65535,
                              "placeholder": "10", "required": True, "when": {"rtype": sorted(zones.PRIORITY)}}],
                  "submit": "Review the change",
-                 "confirm": {"title": f"Set this record in {name}?", "words": "{name} {rtype} {data} is set in {domain}. " + kept,
-                             "yes": "Set the record"}},
+                 "confirm": {"title": f"Add this record to {name}?",
+                             "words": "{name} {rtype} {data} is added to {domain}, beside the host's others: every other "
+                                      "record is kept.",
+                             "yes": "Add the record"}},
                 {"id": f"remove:{name}", "hook": "remove_record", "title": f"Remove a record from {name}",
                  "fields": [domain, {"name": "record", "label": "Record", "type": "fixed"},
                             {"name": "name", "label": "Name", "type": "fixed"}, {"name": "rtype", "label": "Type", "type": "fixed"},
                             {"name": "data", "label": "Data", "type": "fixed"}],
                  "confirm": {"title": f"Remove this record from {name}?", "words": "{name} {rtype} {data} is removed from "
-                             "{domain}. " + kept, "yes": "Remove the record", "danger": True}},
+                             "{domain}. Every other record is kept.", "yes": "Remove the record", "danger": True}},
             ]
         groups = {str(g.get("id")): g for g in (read.get("groups") or [])}
         for gid in sorted(read_rules):
@@ -1153,7 +1351,8 @@ class VultrPlugin(MachinePlugin):
                                 "you out of them over SSH (the refusal above says which). Make it anyway?")}
             out += [
                 {"id": f"rule-add:{gid}", "hook": "add_rule", "title": f"Add a rule to {title}",
-                 "note": "An inbound rule letting traffic in; a group is enforced once it holds a rule.",
+                 "note": "An inbound rule letting traffic in; Vultr enforces a group once it holds a rule, and then drops "
+                         "everything no rule lets in.",
                  "fields": [group,
                             {"name": "ip_type", "label": "IP", "type": "choice", "value": "v4",
                              "choices": [{"value": "v4", "title": "IPv4"}, {"value": "v6", "title": "IPv6"}]},
@@ -1171,8 +1370,9 @@ class VultrPlugin(MachinePlugin):
                  "submit": "Review the rule",
                  "confirm": {"title": f"Add this rule to {title}?",
                              "words": "{protocol} {port} from {subnet}/{subnet_size} ({ip_type}) is let in to the instances "
-                                      f"linked to {title}. A risky rule (SSH or every port open to everyone, or a group's "
-                                      "first rule) is asked again.",
+                                      f"linked to {title}. Asked again when risky: every port, SSH, RDP, VNC or Docker's "
+                                      "API open to everyone, or the group's first rule while instances are linked to it "
+                                      "(from then on everything else is dropped).",
                              "yes": "Add the rule"}},
                 {"id": f"rule-remove:{gid}", "hook": "remove_rule", "title": f"Remove a rule from {title}",
                  "fields": [group, {"name": "rule", "label": "Rule", "type": "fixed"},
@@ -1189,7 +1389,7 @@ class VultrPlugin(MachinePlugin):
                 {"id": "key-add", "hook": "add_key", "title": "Add an SSH key",
                  "note": "Copied to the instances deployed from now on; no instance running changes.",
                  "fields": [{"name": "name", "label": "Name", "type": "text", "required": True, "placeholder": "laptop"},
-                            {"name": "ssh_key", "label": "Public key", "type": "text", "required": True,
+                            {"name": "ssh_key", "label": "Public key", "type": "text", "required": True, "secret": True,
                              "placeholder": "ssh-ed25519 AAAA... you@host", "note": "the .pub file's one line; never a private key"}],
                  "confirm": {"title": "Add this SSH key?", "words": "{name} is added to the account's SSH keys, for the "
                              "instances deployed from now on.", "yes": "Add the key"}},

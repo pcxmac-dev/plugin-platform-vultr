@@ -27,6 +27,7 @@ G_WEB = "1e7bb4c2-7dbd-4ad4-a4b6-a6d6b8e0b0a1"
 G_EMPTY = "5b1f0b3e-9c1d-4e7a-8f00-2d3c4b5a6f70"
 G_LONE = "7d0c3a9e-1b2f-4c5d-8e6f-0a1b2c3d4e5f"
 BARE_PASSWORD = "example-password"  # a bare metal server's default password, as the list gives it: never shown
+KVM = "https://console.vultr.com/subs/vps/novnc/api.php?data=00example11223344"  # an instance's console link: never handed on
 
 
 def public_key(seed: int = 1, kind: str = "ssh-ed25519", comment: str = "you@host") -> str:
@@ -53,6 +54,8 @@ class FakeVultr:
         self.key = key
         self.requests: list[tuple[str, str, dict, object]] = []
         self.refuse_ip: str | None = None  # every request answered 401 "Unauthorized IP address: ..."
+        self.gate = None  # (test(method, path, query), reached, release): such a request held until `release` is set
+        self.down = False  # no answer at all (a broken connection)
         self.fail: dict[tuple[str, str], tuple[int, str]] = {}  # (method, path) -> (status, words)
         self.limited = 0  # the next requests answered 429 (Retry-After: 1)
         self.page_most = 500  # the most a page holds (the reference's Max)
@@ -65,7 +68,7 @@ class FakeVultr:
             {"id": WEB, "os": "Debian 12 x64 (bookworm)", "ram": 1024, "disk": 25, "main_ip": "203.0.113.10", "vcpu_count": 1,
              "region": "ewr", "plan": "vc2-1c-1gb", "date_created": "2026-01-05T10:00:00+00:00", "status": "active",
              "power_status": "running", "server_status": "ok", "v6_main_ip": "2001:db8::10", "label": "web-1",
-             "hostname": "web-1", "firewall_group_id": G_WEB, "features": ["ipv6"], "tags": ["web"]},
+             "hostname": "web-1", "firewall_group_id": G_WEB, "features": ["ipv6"], "tags": ["web"], "kvm": KVM},
             {"id": DB, "os": "Ubuntu 24.04 LTS x64", "ram": 2048, "disk": 64, "main_ip": "203.0.113.20", "vcpu_count": 1,
              "region": "ams", "plan": "vhf-1c-2gb", "date_created": "2026-02-01T08:30:00+00:00", "status": "active",
              "power_status": "stopped", "server_status": "ok", "v6_main_ip": "", "label": "db-1", "hostname": "db-1",
@@ -160,6 +163,11 @@ class FakeVultr:
         query = dict(parse_qsl(parts.query, keep_blank_values=True))
         data = json.loads(body) if body else None
         self.requests.append((method, path, query, data))
+        if self.gate is not None and self.gate[0](method, path, query):  # held until the test lets it through
+            self.gate[1].set()
+            self.gate[2].wait(10)
+        if self.down:
+            raise ConnectionError("no route to host")
         if headers.get("Authorization") != f"Bearer {self.key}":
             return error(401, "Invalid API token.")
         if self.refuse_ip:
@@ -345,16 +353,24 @@ def settings_of(api: bool = True, ddns: bool = False, **more) -> dict[str, str]:
     return out
 
 
+class App:
+    """An app attaching the plugin, by its NAME: the platform ("platform") or another (the charts app run alone)."""
+
+    def __init__(self, name: str = "platform"):
+        self.NAME = name
+
+
 @pytest.fixture(autouse=True)
-def _no_vultr_no_network(monkeypatch):
+def _no_vultr_no_network(monkeypatch, tmp_path):
     """No test reaches Vultr, a resolver or this machine's settings: the REST client's HTTPS and nslookup refused, every
-    VULTR_ variable cleared."""
+    VULTR_ variable cleared, the platform's folder the test's own."""
     def refused(*a, **k):
         raise AssertionError("a test reached for the network")
     monkeypatch.setattr(rest_mod, "_requests_transport", refused)
     monkeypatch.setattr(dns_mod, "query", refused)
     for n in NAMES:
         monkeypatch.delenv(n, raising=False)
+    monkeypatch.setenv("LIMINAL_PLATFORM_DIR", str(tmp_path / "platform"))
 
 
 @pytest.fixture
@@ -367,13 +383,20 @@ def env(monkeypatch):
 
 
 @pytest.fixture
-def made():
-    """A plugin over the stand-ins: (plugin, fake Vultr). `public` is this network's address as the stand-in says it."""
-    def make(fake: FakeVultr | None = None, public: str | None = HOME):
+def made(tmp_path):
+    """A plugin over the stand-ins: (plugin, fake Vultr). `public` is this network's address as the stand-in says it (a
+    function giving it, for one that changes); `folder`, Dynamic DNS's state's (the test's own unless given: two plugins
+    sharing one stand for a restart)."""
+    def make(fake: FakeVultr | None = None, public=HOME, folder=None):
         fake = fake or FakeVultr()
         slept: list[float] = []
-        p = VultrPlugin(transport=fake, public=lambda: (public, "a stand-in") if public else (None, "no server answered"),
-                        sleep=slept.append, gap=0.0)
+        ask = public if callable(public) else (lambda: public)
+
+        def address():
+            ip = ask()
+            return (ip, "a stand-in") if ip else (None, "no server answered")
+        p = VultrPlugin(transport=fake, public=address, sleep=slept.append, gap=0.0,
+                        folder=folder if folder is not None else tmp_path / "vultr")
         p.slept = slept
         return p, fake
     return make

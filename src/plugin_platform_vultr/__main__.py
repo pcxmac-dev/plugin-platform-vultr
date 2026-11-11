@@ -8,15 +8,18 @@ EnvironmentLogin: the variables as this shell has them).
     records DOMAIN                           a domain's records
     firewalls                                the firewall groups and their rules
     keys                                     the account's SSH keys
-    ddns [--now]                             a Dynamic DNS pass: a host's record set where it differs (--now: every host)
+    ddns [--now]                             a Dynamic DNS pass: a host of its own set where it differs (--now: every one);
+                                             a host holding another address left as it is (Take over… on the page)
     power NAME on|off|reboot                 an instance started, or halted or rebooted (each asked twice): NAME its
                                              label or ID
-    set DOMAIN NAME TYPE DATA [--ttl N] [--priority N]
-                                             a record set, every other record kept
+    set DOMAIN NAME TYPE DATA [--ttl N]      an A, AAAA or CNAME set: it replaces the host's records of that type (asked
+                                             a second time before any other is removed); every other record kept
+    add DOMAIN NAME TYPE DATA [--ttl N] [--priority N]
+                                             a record added beside the host's others, every other record kept
     remove DOMAIN NAME TYPE [DATA]           a record removed, the rest kept
 
-Each change asks "yes" on the terminal first (a halt and a reboot twice); --json prints the answer as JSON. The firewall rules and the
-SSH keys are changed from the platform's page."""
+Each change asks "yes" on the terminal first (a halt, a reboot and a set replacing others twice); --json prints the
+answer as JSON. The firewall rules and the SSH keys are changed from the platform's page."""
 from __future__ import annotations
 
 import argparse
@@ -25,6 +28,7 @@ import sys
 
 from . import (HALT_WORDS, MACHINE, REBOOT_ACCEPT_WORDS, REBOOT_WORDS, START_WORDS, STOPPED_BILLS_SAID, money, name_of,
                when)
+from . import ACCEPT_REPLACE
 from . import records as zones
 from .api import RestError
 
@@ -47,11 +51,15 @@ def parser() -> argparse.ArgumentParser:
     w = sub.add_parser("power", help="an instance started, halted or rebooted")
     w.add_argument("name", help="its label, hostname or ID")
     w.add_argument("action", choices=("on", "off", "reboot"))
-    s = sub.add_parser("set", help="a record set, every other record kept")
+    s = sub.add_parser("set", help="an A, AAAA or CNAME set: it replaces the host's records of that type")
     for a in ("domain", "name", "type", "data"):
         s.add_argument(a)
     s.add_argument("--ttl", type=int)
-    s.add_argument("--priority", type=int, help="an MX or SRV record's priority")
+    a_ = sub.add_parser("add", help="a record added beside the host's others, every other record kept")
+    for a in ("domain", "name", "type", "data"):
+        a_.add_argument(a)
+    a_.add_argument("--ttl", type=int)
+    a_.add_argument("--priority", type=int, help="an MX or SRV record's priority")
     m = sub.add_parser("remove", help="a record removed, the rest kept")
     for a in ("domain", "name", "type"):
         m.add_argument(a)
@@ -122,7 +130,8 @@ def main(argv: list[str] | None = None, plugin=None, out=None, err=None, ask=Non
                      for k in answer] or ["no SSH keys in this account"]
         elif what == "ddns":
             answer = p.ddns_update(force=args.now)
-            lines = [f"{h['host']:<32} {h['address'] or '–':<16} {h['result']} (checked {when(h['checkedAt'])})" for h in answer]
+            lines = [f"{h['host']:<32} {h['address'] or '–':<16} {h['result']} (checked {when(h['checkedAt'])})"
+                     for h in answer["hosts"]] + [line for line in answer["lines"] if line.startswith("not kept:")]
         elif what == "power":
             found = [i for i in p.servers() if args.name in (i.get("label"), i.get("hostname"), i.get("id"))]
             if len(found) != 1:
@@ -142,11 +151,29 @@ def main(argv: list[str] | None = None, plugin=None, out=None, err=None, ask=Non
             answer = getattr(p, action)(str(inst.get("id")), label, *([True] if second else []))
             lines = report_lines(answer)
         elif what == "set":
-            if not confirmed(ask, f"{args.name} {args.type.upper()} {args.data} is set in {args.domain}; every other record "
-                                  "is kept."):
+            kind = args.type.strip().upper()
+            if kind not in zones.SET_TYPES:
+                tell(f"refused: set sets an A, AAAA or CNAME record (it replaces the host's records of that type); "
+                     f"a {kind} record is added: add {args.domain} {args.name} {kind} ...")
+                return 1
+            if not confirmed(ask, f"{args.name} {kind} is set to {args.data} in {args.domain}: it replaces the host's "
+                                  f"{kind} records (you are asked again before any other is removed); every record of "
+                                  "another host or type is kept."):
                 tell("nothing done")
                 return 1
-            answer = p.set_record(args.domain, args.name, args.type, args.data, ttl=args.ttl, priority=args.priority)
+            try:
+                answer = p.set_record(args.domain, args.name, kind, args.data, ttl=args.ttl)
+            except zones.Refusal as e:
+                if e.accept != ACCEPT_REPLACE or not confirmed(ask, f"{e} Asked a second time:"):
+                    raise
+                answer = p.set_record(args.domain, args.name, kind, args.data, ttl=args.ttl, accept_replace=True)
+            lines = report_lines(answer)
+        elif what == "add":
+            if not confirmed(ask, f"{args.name} {args.type.upper()} {args.data} is added to {args.domain}, beside the "
+                                  "host's others: every other record is kept."):
+                tell("nothing done")
+                return 1
+            answer = p.add_record(args.domain, args.name, args.type, args.data, ttl=args.ttl, priority=args.priority)
             lines = report_lines(answer)
         else:  # remove
             domain = zones.valid_domain(args.domain)
@@ -174,7 +201,7 @@ def main(argv: list[str] | None = None, plugin=None, out=None, err=None, ask=Non
     else:
         for line in lines:
             say(line)
-    if what in ("set", "remove", "power") and answer.get("ok") is False:
+    if what in ("set", "add", "remove", "power") and answer.get("ok") is False:
         return 1
     return 0
 

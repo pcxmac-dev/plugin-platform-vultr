@@ -1,18 +1,32 @@
-"""Dynamic DNS through Vultr's DNS (liminal_libs.machines.ddns.Keeper): this network's address asked of the name servers
-the plugin names, each host's A record read through the API, set only where it differs (every host with Update DNS now),
-made where there is none, the host's other A records removed; a host in none of the account's domains said. Over the
-stand-ins alone."""
+"""Dynamic DNS through Vultr's DNS (liminal-libs 1.49.2's Keeper; 0.1.1, after an audit found a live record pointed at
+home within a minute, unasked): it changes only what is its own, a host with no A record (made), one already pointing at
+this network or at the address it set last (kept current, after a restart too), and one the user took over on the page.
+A host holding another address, or several, is left as it is, its row offering Take over…; several addresses are never
+cut to one unasked. Update DNS now is a confirmed form. A pass ends once the plugin is detached. Over the stand-ins alone."""
 from __future__ import annotations
 
-from conftest import HOME, FakeVultr, settings_of
+import json
+import threading
+import time
+
+import pytest
+
+import plugin_platform_vultr.settings as settings_mod
+from conftest import HOME, App, FakeVultr, Pairs, settings_of
 from plugin_platform_vultr import DDNS_TTL, PUBLIC_IPV4
+from plugin_platform_vultr.records import Refusal
 
 HOME_ID = "a0a0a0a0-0000-4000-8000-000000000006"
+NEW_HOME = "93.184.216.99"
 
 
-def ddns(made, env, fake=None, public=HOME, **more):
+def ddns(made, env, fake=None, public=HOME, folder=None, **more):
     env(settings_of(ddns=True, **more))
-    return made(fake, public=public)
+    return made(fake, public=public, folder=folder)
+
+
+def ddns_table(status: dict) -> dict:
+    return next(t for t in status["tables"] if t["title"] == "Dynamic DNS")
 
 
 def test_the_public_address_is_asked_of_the_servers_the_plugin_names():
@@ -20,67 +34,163 @@ def test_the_public_address_is_asked_of_the_servers_the_plugin_names():
                            ("o-o.myaddr.l.google.com", "txt", "216.239.32.10", "Google"))
 
 
-def test_a_host_that_differs_is_set_and_one_that_is_current_is_left(made, env):
-    p, fake = ddns(made, env)
+def test_a_host_holding_another_address_is_left_as_it_is_its_row_offering_take_over(made, env):
+    p, fake = ddns(made, env)  # home.example.com holds 198.51.100.7: the user's, not Dynamic DNS's
     out = p.ddns_update(force=False)
-    assert out == [{"host": "home.example.com", "address": HOME, "checkedAt": out[0]["checkedAt"],
-                    "updatedAt": out[0]["updatedAt"], "result": "set (was 198.51.100.7)", "ok": True}]
-    assert fake.writes() == [("PATCH", f"/domains/example.com/records/{HOME_ID}", {"data": HOME})]
-    reads = [q for m, path, q, b in fake.requests if path == "/domains/example.com/records"]
-    assert reads[0]["name"] == "home" and "type" not in reads[0]  # the host's records by its name (a CNAME there is seen)
-    assert fake.calls()[0] == "GET /domains"  # the account's domains read first: the hosts are split against them
-    n = len(fake.requests)
-    assert p.ddns_update(force=False)[0]["result"] == "current" and len(fake.writes()) == 1
-    assert [c for c in fake.calls()[n:]] == ["GET /domains/example.com/records"]
+    (home,) = out["hosts"]
+    assert home["ok"] is False and home["foreign"] is True and home["holds"] == ["198.51.100.7"]
+    assert home["result"] == "holds 198.51.100.7, not this network's address: left as it is (Take over… to point it here)"
+    assert fake.writes() == [] and fake.calls()[0] == "GET /domains"  # the domains read first: the hosts split against them
+    p.ask("ddns_update")  # Update DNS now (force) leaves it as it is too
+    assert fake.writes() == []
     st = p.status()
-    ddns_table = st["tables"][0]
-    assert ddns_table["title"] == "Dynamic DNS" and ddns_table["rows"][0][:2] == ["home.example.com", HOME]
-    assert f"this network's address: {HOME}" in ddns_table["note"]
-    assert [a["hook"] for a in st["actions"]] == ["refresh", "ddns_update"]
+    row = ddns_table(st)["rows"][0]
+    assert row[:2] == ["home.example.com", "198.51.100.7"]
+    assert row[-1] == {"form": "ddns-take", "title": "Take over…", "label": "Take over home.example.com",
+                       "values": {"host": "home.example.com", "holds": "198.51.100.7"}}
+    forms = {f["id"]: f for f in st["forms"]}
+    assert forms["ddns-take"]["hook"] == "ddns_take_over" and forms["ddns-take"]["confirm"]["danger"] is True
+    assert "stops answering at {host}" in forms["ddns-take"]["confirm"]["words"]
+    assert forms["ddns-now"]["hook"] == "ddns_update" and forms["ddns-now"]["fields"] == []
+    assert {"form": "ddns-now", "title": "Update DNS now"} in st["actions"]
+    assert not [a for a in st["actions"] if a.get("hook") == "ddns_update"]  # never asked on one click
+    assert "Dynamic DNS: home.example.com: holds 198.51.100.7" in st["problem"]
 
 
-def test_update_dns_now_checks_every_host_and_sends_nothing_where_it_is_already_right(made, env):
+def test_take_over_then_a_pass_sets_it(made, env):
     p, fake = ddns(made, env)
-    fake.records["example.com"][5]["data"] = HOME
-    out = p.ask("ddns_update")  # the page's Update DNS now (force)
-    assert out[0]["result"] == "current (nothing to send)" and out[0]["ok"] and fake.writes() == []
+    p.ddns_update(force=False)
+    take = ddns_table(p.status())["rows"][0][-1]
+    n = len(fake.requests)
+    with pytest.raises(Refusal, match="holds 198.51.100.7 now, not 203.0.113.9: nothing taken over"):
+        p.ask("ddns_take_over", "home.example.com", "203.0.113.9")  # what the page showed is not what it holds
+    with pytest.raises(Refusal, match="none of VULTR_DDNS_HOSTS"):
+        p.ask("ddns_take_over", "www.example.com", "")
+    assert all(m == "GET" for m, path, q, b in fake.requests[n:])
+    rep = p.ask("ddns_take_over", *take["values"].values())
+    assert rep["ok"] and rep["said"] == "home.example.com taken over: set (was 198.51.100.7)"
+    assert fake.writes() == [("PATCH", f"/domains/example.com/records/{HOME_ID}", {"data": HOME})]
+    kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
+    assert kept == {"own": {"home.example.com": HOME}, "taken": ["home.example.com"]}
+    assert p.ddns_update(force=False)["hosts"][0]["result"] == "current" and len(fake.writes()) == 1
 
 
-def test_a_host_without_a_record_is_made_and_the_others_of_its_kind_removed(made, env):
+def test_a_host_with_several_addresses_is_never_cut_to_one_unasked(made, env):
     fake = FakeVultr()
     fake.records["example.com"].append({"id": "a0a0a0a0-0000-4000-8000-000000000007", "type": "A", "name": "home",
-                                        "data": "198.51.100.8", "ttl": 120, "priority": 0})
-    p, fake = ddns(made, env, fake, VULTR_DDNS_HOSTS="home.example.com, @.example.net")
-    out = {h["host"]: h for h in p.ddns_update(force=False)}
-    assert out["example.net"]["result"] == "made (was none)" and out["example.net"]["address"] == HOME
-    assert ("POST", "/domains/example.net/records", {"name": "", "type": "A", "data": HOME, "ttl": DDNS_TTL}) in fake.writes()
-    assert out["home.example.com"]["result"] == "set (its other A records removed: 198.51.100.8) (was 198.51.100.7, 198.51.100.8)"
-    assert ("DELETE", "/domains/example.com/records/a0a0a0a0-0000-4000-8000-000000000007", None) in fake.writes()
+                                        "data": HOME, "ttl": 120, "priority": 0})  # this network's address among two
+    p, fake = ddns(made, env, fake)
+    for force in (False, True):
+        (home,) = p.ddns_update(force=force)["hosts"]
+        assert home["result"].startswith(f"holds 2 addresses (198.51.100.7, {HOME}): left as it is")
+    assert fake.writes() == []
+    rep = p.ask("ddns_take_over", "home.example.com", f"198.51.100.7, {HOME}")  # taken over: what it holds is dropped
+    assert rep["ok"] and fake.writes() == [("PATCH", f"/domains/example.com/records/{HOME_ID}", {"data": HOME}),
+                                           ("DELETE", "/domains/example.com/records/a0a0a0a0-0000-4000-8000-000000000007",
+                                            None)]
     assert [r for r in fake.zone() if r[1] == "A" and "home" in r[0]] == [("home.example.com", "A", HOME)]
+
+
+def test_a_host_without_a_record_is_made_and_its_own_kept_current_after_the_address_changes(made, env, tmp_path):
+    now, t = [HOME], [1_000_000.0]
+    folder = tmp_path / "kept"
+    p, fake = ddns(made, env, public=lambda: now[0], folder=folder, VULTR_DDNS_HOSTS="@.example.net")
+    p._clock = lambda: t[0]
+    (apex,) = p.ddns_update(force=False)["hosts"]
+    assert apex["result"] == "made (was none)" and apex["address"] == HOME
+    assert ("POST", "/domains/example.net/records", {"name": "", "type": "A", "data": HOME, "ttl": DDNS_TTL}) in fake.writes()
+    now[0] = NEW_HOME  # this network's address changed: the record Dynamic DNS set is its own, so it follows
+    t[0] += 601  # once the address it keeps is old (the keeper asks it again after ten minutes)
+    (apex,) = p.ddns_update(force=False)["hosts"]
+    made_id = next(r["id"] for r in fake.records["example.net"] if r["type"] == "A")
+    assert apex["result"] == f"set (was {HOME})" and fake.writes()[-1] == (
+        "PATCH", f"/domains/example.net/records/{made_id}", {"data": NEW_HOME})
+    # a restart (a new plugin, the same folder): its own record still known by its state file
+    later, _ = made(fake, public=lambda: "93.184.216.100", folder=folder)
+    (apex,) = later.ddns_update(force=False)["hosts"]
+    assert apex["result"] == f"set (was {NEW_HOME})" and fake.writes()[-1][2] == {"data": "93.184.216.100"}
+
+
+def test_update_dns_now_rewrites_only_what_is_its_own(made, env):
+    fake = FakeVultr()
+    fake.records["example.com"][5]["data"] = HOME  # home already points here: its own from the first look
+    p, fake = ddns(made, env, fake)
+    out = p.ask("ddns_update")  # the page's Update DNS now, once confirmed (force)
+    assert out["said"] == "Dynamic DNS: 1 of 1 host current" and out["ok"] is True
+    assert out["hosts"][0]["result"] == "current (nothing to send)" and fake.writes() == []
 
 
 def test_a_cname_host_and_a_host_in_no_domain_of_the_account_are_said(made, env):
     p, fake = ddns(made, env, VULTR_DDNS_HOSTS="www.example.com, home.elsewhere.org")
     out = p.ddns_update(force=False)
-    assert out[0]["host"] == "www.example.com" and out[0]["ok"] is False
-    assert "is a CNAME: Dynamic DNS keeps an A record" in out[0]["result"] and fake.writes() == []
+    (www,) = out["hosts"]
+    assert www["host"] == "www.example.com" and www["ok"] is False
+    assert "is a CNAME: Dynamic DNS keeps an A record" in www["result"] and fake.writes() == []
+    assert "not kept: home.elsewhere.org is in none of the account's domains" in out["lines"]
     p.refresh()
     st = p.status()
     assert "home.elsewhere.org is in none of the account's domains" in st["problem"]
     assert "www.example.com: its record could not be read" in st["problem"]
-    assert "not kept: home.elsewhere.org is in none of the account's domains" in st["tables"][0]["note"]
+    assert "not kept: home.elsewhere.org is in none of the account's domains" in ddns_table(st)["note"]
 
 
 def test_no_address_found_means_no_write(made, env):
-    p, fake = ddns(made, env, public=None)
-    out = p.ddns_update(force=True)
-    assert out[0]["ok"] is False and out[0]["result"].startswith("this network's address was not found")
+    p, fake = ddns(made, env, public=None, VULTR_DDNS_HOSTS="@.example.net")
+    (apex,) = p.ddns_update(force=True)["hosts"]
+    assert apex["ok"] is False and apex["result"].startswith("this network's address was not found")
     assert fake.writes() == []
 
 
 def test_the_hosts_are_matched_once_the_domains_are_read(made, env):
     p, fake = ddns(made, env)
     st = p.status()  # nothing read yet: no host matched, nothing said wrong
-    assert st["valid"] is True and "problem" not in st and st["tables"][0]["rows"] == []
-    assert st["tables"][0]["empty"] == "The hosts are matched to the account's domains once they are read."
+    assert st["valid"] is True and "problem" not in st and ddns_table(st)["rows"] == []
+    assert ddns_table(st)["empty"] == "The hosts are matched to the account's domains once they are read."
     assert fake.requests == []
+
+
+def test_a_host_taken_out_of_the_settings_is_let_go(made, env, monkeypatch):
+    p, fake = ddns(made, env, VULTR_DDNS_HOSTS="@.example.net, home.example.com")
+    p.ddns_update(force=False)
+    p.ask("ddns_take_over", "home.example.com", "198.51.100.7")
+    kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
+    assert set(kept["own"]) == {"example.net", "home.example.com"} and kept["taken"] == ["home.example.com"]
+    monkeypatch.setenv("VULTR_DDNS_HOSTS", "@.example.net")
+    p.ddns_update(force=False)
+    kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
+    assert kept == {"own": {"example.net": HOME}, "taken": []}
+    assert p.keeper().own("home.example.com") is None and not p.keeper().taken("home.example.com")
+
+
+def test_a_pass_under_way_writes_nothing_once_the_plugin_is_detached(made, monkeypatch):
+    """Detached while a pass waits on Vultr: the pass writes nothing after it, and the background reads no setting from
+    the process's environment (the plugin's login is gone)."""
+    reached, release = threading.Event(), threading.Event()
+    fake = FakeVultr()
+    fake.gate = (lambda m, path, q: (m, path) == ("GET", "/domains/example.net/records") and "name" in q,
+                 reached, release)  # the pass's read of the host (by its name), held: the refresh's read is not
+    p, fake = made(fake)
+    asked_env = []
+    real = settings_mod.read
+
+    def read(login=None):
+        if login is None and threading.current_thread().name == "vultr":
+            asked_env.append(time.monotonic())
+        return real(login)
+    monkeypatch.setattr(settings_mod, "read", read)
+    p.attach(App("platform"), Pairs(settings_of(VULTR_DDNS_HOSTS="@.example.net")))
+    detaching = threading.Thread(target=p.detach)
+    try:
+        assert reached.wait(5)  # the background's first pass reads example.net's records: held there
+        detaching.start()
+        end = time.monotonic() + 5
+        while p._rt.stop is not None and time.monotonic() < end:  # told to stop
+            time.sleep(0.01)
+    finally:
+        release.set()
+    detaching.join(10)
+    assert not detaching.is_alive() and not p.working and p.login is None
+    calls = len(fake.requests)
+    time.sleep(0.2)
+    assert not [w for w in fake.writes() if w[1].startswith("/domains/example.net")]  # nothing made after the detach
+    assert len(fake.requests) == calls and asked_env == []

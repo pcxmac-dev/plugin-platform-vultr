@@ -2,11 +2,15 @@
 every other record stays as it is). The reference's record: `id`, `type` (A, AAAA, CNAME, NS, MX, SRV, TXT, CAA, SSHFP),
 `name` (relative to the domain: "" is the domain itself, the apex), `data`, `ttl`, `priority` (MX and SRV only).
 
-A record set is planned against the zone as read just before (`plan_set`): an A, AAAA or CNAME replaces the host's
-records of its type (the first updated, any others deleted); the other types are added beside the host's others, or their
-TTL and priority changed when the same record is there. A CNAME stands alone and never at the apex. A record removed is
-named by its ID and checked against what the page showed (`plan_remove`): one changed since is not removed. After the
-writes the zone is read again and the change checked (`apply`)."""
+Two changes, each planned against the zone as read just before, and each said as it is (0.1.1: an audit found the
+set's confirmation saying every other record was kept while it deleted the host's others of its type):
+- a record **set** (`plan_set`, A, AAAA or CNAME): it *replaces* the host's records of its type, one of them updated and
+  any others deleted (`Plan.removes`: the plugin asks a second time before those go); a CNAME stands alone, never at the
+  domain itself;
+- a record **added** (`plan_add`, every type but CNAME): beside the host's others, which are all kept (the same record
+  there already: its TTL or priority changed when given, else nothing written).
+A record removed is named by its ID and by what the page showed (`plan_remove`: its name, type and data, all of them):
+one changed since is not removed. After the writes the zone is read again and the change checked (`apply`)."""
 from __future__ import annotations
 
 import ipaddress
@@ -14,18 +18,20 @@ import re
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 
-TYPES = {  # what the page's form sets, in the order offered, with what each holds and does
-    "A": "an IPv4 address; replaces the host's A records",
-    "AAAA": "an IPv6 address; replaces the host's AAAA records",
-    "CNAME": "a host name this host stands for; it holds nothing else, and the domain itself takes none",
-    "TXT": "text (SPF, DKIM, DMARC, a verification); added beside the host's others",
-    "MX": "a mail server, with its priority; added beside the others",
-    "NS": "a subdomain's name server; added beside the others",
-    "SRV": "a service: its weight, port and target (5 5060 sip.example.com), with its priority; added beside the others",
-    "CAA": "who may issue certificates: flag, tag and value (0 issue \"letsencrypt.org\"); added beside the others",
-    "SSHFP": "an SSH host key's fingerprint: algorithm, type and hex (4 2 123abc...); added beside the others",
+TYPES = {  # every record type the page writes, with what it holds
+    "A": "an IPv4 address",
+    "AAAA": "an IPv6 address",
+    "CNAME": "a host name this host stands for (it holds nothing else; the domain itself takes none)",
+    "TXT": "text (SPF, DKIM, DMARC, a verification)",
+    "MX": "a mail server, with its priority",
+    "NS": "a subdomain's name server",
+    "SRV": "a service: its weight, port and target (5 5060 sip.example.com), with its priority",
+    "CAA": "who may issue certificates: flag, tag and value (0 issue \"letsencrypt.org\")",
+    "SSHFP": "an SSH host key's fingerprint: algorithm, type and hex (4 2 123abc...)",
 }
-SINGLE = frozenset({"A", "AAAA", "CNAME"})  # set: the host's records of the type replaced
+SINGLE = frozenset({"A", "AAAA", "CNAME"})  # what Set a record… sets: the host's records of the type replaced
+SET_TYPES = {t: f"{TYPES[t]}; replaces the host's {t} records" for t in ("A", "AAAA", "CNAME")}
+ADD_TYPES = {t: f"{TYPES[t]}; added beside the host's others" for t in TYPES if t != "CNAME"}
 PRIORITY = frozenset({"MX", "SRV"})  # the reference: priority "Only required for MX and SRV"
 NAMED = frozenset({"CNAME", "NS", "MX"})  # data that is a host name
 MAX_TEXT = 2048
@@ -195,10 +201,10 @@ def data_for(rtype: str, data: str) -> str:
     raise ValueError(f"{rtype!r} is no record type here: {', '.join(TYPES)}")
 
 
-def record_type(value: str) -> str:
+def record_type(value: str, among=TYPES) -> str:
     t = str(value or "").strip().upper()
-    if t not in TYPES:
-        raise ValueError(f"{value!r} is no record type here: {', '.join(TYPES)}")
+    if t not in among:
+        raise ValueError(f"{value!r} is no record type here: {', '.join(among)}")
     return t
 
 
@@ -226,18 +232,63 @@ def priority_of(value) -> int:
 @dataclass
 class Plan:
     """The writes a change takes, in order (("create", body) | ("update", record, body) | ("delete", record)), what it does
-    in words, and what the zone holds after it (`want`: the record's key there; `gone`: the records' IDs no longer)."""
+    in words, what the zone holds after it (`want`: the record's key there; `gone`: the records' IDs no longer), and the
+    records a set removes besides the one it updates (`removes`: asked about a second time)."""
 
     domain: str
     words: str
     ops: list = field(default_factory=list)
     want: tuple[str, str, str] | None = None
     gone: tuple[str, ...] = ()
+    removes: tuple[Record, ...] = ()
 
 
-def plan_set(records: Sequence[Record], domain: str, name: str, rtype: str, data: str, ttl=None, priority=None) -> Plan:
-    """The writes that set a record (module docstring) against the zone as read (`records`)."""
-    t = record_type(rtype)
+def _cname_rules(here: Sequence[Record], host: str, t: str, domain: str) -> None:
+    shown = host or "@"
+    if t == "CNAME" and host == "":
+        raise Refusal(f"a CNAME cannot stand for the domain itself ({domain}): its other records would be lost to it")
+    if t == "CNAME" and any(r.type != "CNAME" for r in here):
+        raise Refusal(f"{shown} holds other records ({', '.join(sorted({r.type for r in here}))}): a CNAME stands alone")
+    if t != "CNAME" and any(r.type == "CNAME" for r in here):
+        raise Refusal(f"{shown} is a CNAME: it holds no {t} record beside it")
+
+
+def plan_set(records: Sequence[Record], domain: str, name: str, rtype: str, data: str, ttl=None) -> Plan:
+    """The writes that set a record of the host, replacing its records of the type (A, AAAA or CNAME): the one holding
+    the data already, else its first, updated; any others deleted (`removes`)."""
+    t = record_type(rtype, SET_TYPES)
+    host = relative(name, domain)
+    value = data_for(t, data)
+    ttl = ttl_of(ttl) if ttl is not None else None
+    here = [r for r in records if r.name == host]
+    _cname_rules(here, host, t, domain)
+    want = (host, t, norm(t, value))
+    new = Record("", host, t, value, ttl or 0, 0)
+    mine = [r for r in here if r.type == t]
+    if not mine:
+        body = {"name": host, "type": t, "data": value, **({"ttl": ttl} if ttl else {})}
+        return Plan(domain, f"set {new.said()} (the host had no {t} record: one made)", [("create", body)], want)
+    first = next((r for r in mine if r.key() == want), mine[0])
+    rest = tuple(r for r in mine if r is not first)
+    change = {k: v for k, v in (("data", value), ("ttl", ttl)) if v is not None and
+              (k != "data" or first.key() != want) and (k != "ttl" or v != first.ttl)}
+    ops = ([("update", first, change)] if change else []) + [("delete", r) for r in rest]
+    if not ops:
+        return Plan(domain, f"{first.said()} is set already: nothing written", [], want)
+    if first.key() == want:
+        words = f"{first.said()} is set already" + (f"; TTL {ttl}" if "ttl" in change else "")
+    else:
+        words = f"set {new.said()}: it replaces {first.data}"
+    if rest:
+        words += f"; the host's other {t} records removed ({', '.join(r.data for r in rest)})"
+    return Plan(domain, words, ops, want, tuple(r.id for r in rest), rest)
+
+
+def plan_add(records: Sequence[Record], domain: str, name: str, rtype: str, data: str, ttl=None, priority=None) -> Plan:
+    """The write that adds a record beside the host's others, every other record kept (every type but CNAME, which
+    stands alone: Set a record… replaces one); the same record there already: its TTL or priority changed when given and
+    different, else nothing written."""
+    t = record_type(rtype, ADD_TYPES)
     host = relative(name, domain)
     value = data_for(t, data)
     if priority is not None and t not in PRIORITY:
@@ -246,63 +297,41 @@ def plan_set(records: Sequence[Record], domain: str, name: str, rtype: str, data
         raise ValueError(f"an {t} record needs its priority (0 to 65535)")
     ttl = ttl_of(ttl) if ttl is not None else None
     prio = priority_of(priority) if priority is not None else None
-    if t == "CNAME" and host == "":
-        raise Refusal(f"a CNAME cannot stand for the domain itself ({domain}): its other records would be lost to it")
     here = [r for r in records if r.name == host]
-    shown = host or "@"
-    if t == "CNAME" and any(r.type != "CNAME" for r in here):
-        raise Refusal(f"{shown} holds other records ({', '.join(sorted({r.type for r in here}))}): a CNAME stands alone")
-    if t != "CNAME" and any(r.type == "CNAME" for r in here):
-        raise Refusal(f"{shown} is a CNAME: it holds no {t} record beside it")
+    _cname_rules(here, host, t, domain)
     want = (host, t, norm(t, value))
-    new = Record("", host, t, value, ttl or 0, prio or 0)
-    same = [r for r in here if r.key() == want]
-    if t in SINGLE:
-        mine = [r for r in here if r.type == t]
-        if not mine:
-            body = {"name": host, "type": t, "data": value, **({"ttl": ttl} if ttl else {})}
-            return Plan(domain, f"added {new.said()}", [("create", body)], want)
-        first = same[0] if same else mine[0]
-        rest = [r for r in mine if r is not first]
-        change = {k: v for k, v in (("data", value), ("ttl", ttl)) if v is not None and
-                  (k != "data" or first.key() != want) and (k != "ttl" or v != first.ttl)}
-        ops = ([("update", first, change)] if change else []) + [("delete", r) for r in rest]
-        if not ops:
-            return Plan(domain, f"{first.said()} is there already: nothing written", [], want)
-        if first.key() == want:
-            words = f"{first.said()} is there already" + (f"; TTL {ttl}" if "ttl" in change else "")
-        else:
-            words = f"set {new.said()} (it was {first.data})"
-        if rest:
-            words += f"; the host's other {t} records removed ({', '.join(r.data for r in rest)})"
-        return Plan(domain, words, ops, want, tuple(r.id for r in rest))
-    if same:
-        r = same[0]
-        change = {k: v for k, v in (("ttl", ttl), ("priority", prio)) if v is not None and v != getattr(r, k)}
+    same = next((r for r in here if r.key() == want), None)
+    if same is not None:
+        change = {k: v for k, v in (("ttl", ttl), ("priority", prio)) if v is not None and v != getattr(same, k)}
         if not change:
-            return Plan(domain, f"{r.said()} is there already: nothing written", [], want)
-        return Plan(domain, f"{r.said()} is there already; " + ", ".join(f"{k} {v}" for k, v in change.items()),
-                    [("update", r, change)], want)
+            return Plan(domain, f"{same.said()} is there already: nothing written", [], want)
+        return Plan(domain, f"{same.said()} is there already; " + ", ".join(f"{k} {v}" for k, v in change.items()),
+                    [("update", same, change)], want)
     body = {"name": host, "type": t, "data": value, **({"ttl": ttl} if ttl else {}),
             **({"priority": prio} if prio is not None else {})}
-    return Plan(domain, f"added {Record('', host, t, value, 0, prio or 0).said()}", [("create", body)], want)
+    others = [r for r in here if r.type == t]
+    words = f"added {Record('', host, t, value, 0, prio or 0).said()}" + (
+        f" beside the host's {len(others)} other {t} record{'' if len(others) == 1 else 's'}, kept" if others else "")
+    return Plan(domain, words, [("create", body)], want)
 
 
 def plan_remove(records: Sequence[Record], domain: str, record_id: str, name: str = "", rtype: str = "", data: str = "") -> Plan:
-    """The write that removes a record by its ID, once it is checked to be the one the page showed (`name`, `rtype`,
-    `data` when given)."""
+    """The write that removes a record by its ID, once it is checked to be the one the page showed: its name, its type
+    and its data, all three given (a record named by its ID alone is not removed)."""
     rid = str(record_id or "").strip()
     if not rid:
         raise ValueError("no record named (its ID)")
+    if any(x in (None, "") for x in (name, rtype, data)):
+        raise ValueError("a record is removed by its ID with its name, type and data as shown (all three)")
     found = next((r for r in records if r.id == rid), None)
     if found is None:
         raise Refusal(f"{domain} holds no record {rid} any more: nothing removed (the page shows the zone as read now)")
     shown = []
-    if name not in (None, "") and relative(name, domain) != found.name:
+    if relative(name, domain) != found.name:
         shown.append(f"named {name}")
-    if rtype not in (None, "") and str(rtype).strip().upper() != found.type:
+    if str(rtype).strip().upper() != found.type:
         shown.append(f"of type {rtype}")
-    if data not in (None, "") and norm(found.type, data) != norm(found.type, found.data):
+    if norm(found.type, data) != norm(found.type, found.data):
         shown.append(f"holding {data}")
     if shown:
         raise Refusal(f"record {rid} of {domain} is {found.said()} now, not the one shown ({', '.join(shown)}): nothing "
@@ -311,14 +340,18 @@ def plan_remove(records: Sequence[Record], domain: str, record_id: str, name: st
 
 
 # -- the writes, and the check after them ------------------------------------------------------------------------------------
-def apply(api, plan: Plan) -> tuple[dict, tuple[Record, ...] | None]:
+def apply(api, plan: Plan, stop=None) -> tuple[dict, tuple[Record, ...] | None]:
     """A plan's writes sent (the creates and updates before the deletes: a failure halfway never leaves the host with
-    less than it had), the zone read again and checked. (The report, the zone read after; None when it could not be.)"""
+    less than it had), the zone read again and checked. (The report, the zone read after; None when it could not be.)
+    `stop` set (the plugin detached) ends it before its next write."""
     sent: list[str] = []
     if not plan.ops:
         return {"domain": plan.domain, "changed": False, "said": plan.words, "ok": True, "lines": []}, None
     ordered = [op for op in plan.ops if op[0] != "delete"] + [op for op in plan.ops if op[0] == "delete"]
     for op in ordered:
+        if stop is not None and stop.is_set():
+            return {"domain": plan.domain, "changed": bool(sent), "said": plan.words, "ok": None, "sent": sent,
+                    "lines": [*sent, "stopped before the rest: the plugin was detached"]}, None
         if op[0] == "create":
             made = api.create_record(plan.domain, op[1])
             sent.append(f"created {op[1].get('type')} {op[1].get('name') or '@'}" + (f" ({made.get('id')})" if made.get("id") else ""))

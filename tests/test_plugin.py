@@ -9,7 +9,7 @@ import time
 import pytest
 
 import plugin_platform_vultr.__main__ as cli
-from conftest import BARE_PASSWORD, DB, G_WEB, HOME, KEY, WEB, FakeVultr, Pairs, public_key, settings_of
+from conftest import BARE_PASSWORD, DB, G_WEB, HOME, KEY, KVM, WEB, App, FakeVultr, Pairs, public_key, settings_of
 from plugin_platform_vultr import NOT_SET, RETRY_S, STOPPED_BILLS_SAID
 from plugin_platform_vultr.settings import read
 
@@ -187,14 +187,14 @@ def test_a_change_of_the_key_makes_a_failed_read_untried(made, env, monkeypatch)
     assert p.config(fresh=True).api_key == KEY + "X" and p.status()["valid"] is True
 
 
-def test_attached_it_reads_in_the_background_through_the_apps_login_and_detached_nothing_runs(made):
+def test_attached_by_the_platform_it_reads_in_the_background_and_detached_nothing_runs(made):
     p, fake = made()
-    login = Pairs(settings_of(ddns=True))
-    p.attach(object(), login)
+    login = Pairs(settings_of(VULTR_DDNS_HOSTS="@.example.net"))
+    p.attach(App("platform"), login)
     try:
         assert p.working
         assert wait_until(lambda: p.status()["summary"].startswith("3 instances (2 running)")
-                          and p.status()["summary"].endswith(f"home.example.com at {HOME}"))
+                          and p.status()["summary"].endswith(f"example.net at {HOME}"))
         assert "vultr-api-key" in login.asked
     finally:
         p.detach()
@@ -202,6 +202,63 @@ def test_attached_it_reads_in_the_background_through_the_apps_login_and_detached
     calls = len(fake.requests)
     time.sleep(0.1)
     assert len(fake.requests) == calls
+
+
+def test_attached_by_another_app_or_not_set_up_nothing_runs(made):
+    """The charts app run alone attaches every plugin it finds: no background for it (the audit). Nor while no key is
+    set; entered on the platform's page, the key starts it."""
+    p, fake = made()
+    p.attach(App("charts"), Pairs(settings_of(ddns=True)))
+    try:
+        time.sleep(0.1)
+        assert not p.working and fake.requests == []
+    finally:
+        p.detach()
+    login = Pairs({})
+    p.attach(App("platform"), login)
+    try:
+        time.sleep(0.1)
+        assert not p.working and fake.requests == []  # not set up: no thread at all
+        login.pairs["vultr-api-key"] = KEY  # what the platform's Settings… keeps, then tells the plugin
+        p.settings_changed()
+        assert p.working and wait_until(lambda: p.status()["summary"].startswith("3 instances"))
+    finally:
+        p.detach()
+    assert not p.working
+
+
+def test_a_read_that_does_not_get_through_leaves_it_valid_and_is_tried_again_soon(made, env):
+    """No answer (a broken connection), the rate limit or Vultr's own failure is no refusal of the key: the plugin stays
+    valid, the trouble said (the audit: one dropped connection turned it grey for a quarter of an hour)."""
+    env(settings_of())
+    p, fake = made()
+    fake.down = True
+    with pytest.raises(Exception, match="no route to host"):
+        p.refresh()
+    st = p.status()
+    assert st["valid"] is True and st["problem"].startswith("the last read did not get through")
+    assert "no route to host" in st["problem"]
+    fake.down = False
+    fake.fail[("GET", "/account")] = (503, "Service Unavailable")
+    p.refresh()  # one part's failure: that part not read, the rest is
+    st = p.status()
+    assert st["valid"] is True and "account not read: GET /v2/account: HTTP 503" in st["problem"]
+    del fake.fail[("GET", "/account")]
+    p.refresh()
+    st = p.status()
+    assert st["valid"] is True and "problem" not in st  # read again: the trouble gone
+
+
+def test_an_instances_console_link_is_never_handed_on(made, env):
+    env(settings_of())
+    p, fake = made()
+    servers = p.servers()
+    assert servers[0]["label"] == "web-1" and "kvm" not in servers[0]
+    lines = []
+    assert cli.main(["--json", "servers"], plugin=p, out=lines.append, err=lines.append) == 0
+    assert KVM not in "\n".join(lines)
+    p.refresh()
+    assert KVM not in json.dumps(p.status())
 
 
 def test_the_hooks_are_asked_by_name_as_the_platform_asks_them(made, env):
@@ -243,11 +300,19 @@ def test_the_command_line(made, env):
     assert run("records", "example.com") == 0 and len(lines) == 6
     assert run("firewalls") == 0 and lines[0] == "web: 2 rules, 1 instances linked"
     assert run("keys") == 0 and lines[0].startswith("laptop")
-    assert run("ddns") == 0 and lines[0].startswith("home.example.com") and "set (was 198.51.100.7)" in lines[0]
+    assert run("ddns") == 0 and lines[0].startswith("home.example.com") and "left as it is" in lines[0]  # not its own
+    assert fake.writes() == []
     assert run("set", "example.com", "blog", "A", "203.0.113.30") == 1 and errors == ["nothing done"]  # not "yes"
     assert ("blog", "A", "203.0.113.30") not in fake.zone()
-    assert run("set", "example.com", "blog", "A", "203.0.113.30", say=["yes"]) == 0 and lines[0] == "added blog A 203.0.113.30"
-    assert ("blog", "A", "203.0.113.30") in fake.zone()
+    assert run("set", "example.com", "blog", "A", "203.0.113.30", say=["yes"]) == 0
+    assert lines[0] == "set blog A 203.0.113.30 (the host had no A record: one made)" and ("blog", "A", "203.0.113.30") in fake.zone()
+    assert run("set", "example.com", "blog", "TXT", "hello", say=["yes"]) == 1 and "is added: add example.com" in errors[0]
+    assert run("add", "example.com", "blog", "A", "203.0.113.31", say=["yes"]) == 0
+    assert lines[0] == "added blog A 203.0.113.31 beside the host's 1 other A record, kept"
+    assert run("set", "example.com", "blog", "A", "203.0.113.32", say=["yes"]) == 1  # replaces two: asked again, not given
+    assert errors[0].startswith("refused: blog holds 2 A records") and ("blog", "A", "203.0.113.31") in fake.zone()
+    assert run("set", "example.com", "blog", "A", "203.0.113.32", say=["yes", "yes"]) == 0
+    assert [r[2] for r in fake.zone() if r[0] == "blog"] == ["203.0.113.32"]
     assert run("remove", "example.com", "@", "A", say=["yes"]) == 0 and lines[0] == "removed @ A 203.0.113.10"
     assert run("remove", "example.com", "nothing", "TXT", say=["yes"]) == 1 and errors[0].startswith("refused: example.com has no")
     assert run("power", "web-1", "off", say=["yes"]) == 1 and errors == ["nothing done"]  # a halt is asked twice
@@ -278,7 +343,9 @@ def test_the_platform_reads_it_in_its_own_shape(made, env):
     for t in st["tables"]:
         assert set(t) >= {"title", "columns", "rows"} and all(len(r) == len(t["columns"]) for r in t["rows"]), t["title"]
     hooks = p.interface()["hooks"]
-    assert all(a["hook"] in hooks for a in st["actions"]) and all(f["hook"] in hooks for f in st["forms"])
+    forms = {f["id"] for f in st["forms"]}
+    assert all(a["hook"] in hooks if "hook" in a else a["form"] in forms for a in st["actions"])
+    assert all(f["hook"] in hooks for f in st["forms"])
     flat = {k: v for k, v in st.items() if not isinstance(v, (list, dict))}
     assert all(isinstance(v, (str, bool)) for v in flat.values()), flat
     buttons = [c for t in st["tables"] for r in t["rows"] for c in r if isinstance(c, dict) and "form" in c]

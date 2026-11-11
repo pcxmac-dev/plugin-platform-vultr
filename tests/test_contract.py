@@ -23,8 +23,8 @@ def test_every_plugin_here_conforms_to_the_class_contract():
     assert found and all(p.api == "2.2" and not p.is_record for p in found)
     assert {p.SYSTEM for p in found} == {"platform"} and {p.KIND for p in found} == {"machine"}
     assert {(p.name, p.title, p.order, p.ICON) for p in found} == {("vultr", "Vultr", 762, "vultr")}
-    assert module.__version__ == "0.1.0"
-    assert 'version = "0.1.0"' in (PACKAGE.parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    assert module.__version__ == "0.1.1"
+    assert 'version = "0.1.1"' in (PACKAGE.parents[1] / "pyproject.toml").read_text(encoding="utf-8")
 
 
 def test_its_settings_are_pairs_named_by_their_variables():
@@ -35,8 +35,8 @@ def test_its_settings_are_pairs_named_by_their_variables():
     assert "Access Control" in p.keys[0].hint and "Account > API" in p.keys[0].hint  # where the key and its addresses are set
     hooks = p.interface()["hooks"]
     assert {"present", "status", "refresh", "balance", "servers", "domains", "records", "firewalls", "ssh_keys", "start",
-            "reboot", "halt", "set_record", "remove_record", "add_rule", "remove_rule", "add_key", "remove_key",
-            "ddns_update"} <= set(hooks)
+            "reboot", "halt", "set_record", "add_record", "remove_record", "add_rule", "remove_rule", "add_key",
+            "remove_key", "ddns_update", "ddns_take_over"} <= set(hooks)
     assert "instances" not in p.HOOKS[len(type(p).__mro__[1].HOOKS):]  # Vultr's instances are `servers`: `instances` is Docker's
     assert p.interface()["apis"] == ["Vultr API v2"]
 
@@ -133,7 +133,9 @@ def test_the_hooks_the_forms_ask_take_their_fields_in_order():
     p = module.MACHINE
     for hook, fields in (("start", ["instance", "label"]), ("reboot", ["instance", "label", "accept_reboot"]),
                          ("halt", ["instance", "label", "accept_halt"]),
-                         ("set_record", ["domain", "name", "rtype", "data", "ttl", "priority"]),
+                         ("set_record", ["domain", "name", "rtype", "data", "ttl", "accept_replace"]),
+                         ("add_record", ["domain", "name", "rtype", "data", "ttl", "priority"]),
+                         ("ddns_take_over", ["host", "holds"]), ("ddns_update", ["force"]),
                          ("remove_record", ["domain", "record", "name", "rtype", "data"]),
                          ("add_rule", ["group", "ip_type", "protocol", "port", "subnet", "subnet_size", "notes", "accept_risk"]),
                          ("remove_rule", ["group", "rule", "protocol", "port", "source", "accept_risk"]),
