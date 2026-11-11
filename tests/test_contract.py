@@ -131,7 +131,7 @@ def test_what_it_learned_of_its_api_is_keyed_by_the_cards_name(made, env):
 def test_the_hooks_the_forms_ask_take_their_fields_in_order():
     """Each form's fields are the hook's parameters in order (the platform's page sends them so)."""
     p = module.MACHINE
-    for hook, fields in (("start", ["instance", "label"]), ("reboot", ["instance", "label"]),
+    for hook, fields in (("start", ["instance", "label"]), ("reboot", ["instance", "label", "accept_reboot"]),
                          ("halt", ["instance", "label", "accept_halt"]),
                          ("set_record", ["domain", "name", "rtype", "data", "ttl", "priority"]),
                          ("remove_record", ["domain", "record", "name", "rtype", "data"]),

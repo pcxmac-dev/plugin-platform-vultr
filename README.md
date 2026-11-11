@@ -18,7 +18,8 @@ A machine plugin of the platform (`liminal_libs.machines.MachinePlugin`, plugin 
   fingerprints; the block storage volumes; the reserved IPs; and how many bare metal servers, snapshots, backups,
   Kubernetes clusters, load balancers and managed databases the account holds.
 - **It changes only what costs nothing**, each change through a form the page confirms first:
-  - an instance **started** or **rebooted**, or **halted** (asked twice: a halt powers the instance off at once);
+  - an instance **started**, or **rebooted** or **halted** (each asked twice: a reboot is a hard restart, a halt
+    powers the instance off at once);
   - a DNS record **set** (created, or its own record updated) or **removed**, every other record kept;
   - a firewall rule **added** or **removed** (a risky one asked twice: below);
   - an SSH key **added** or **removed**.
@@ -41,8 +42,9 @@ The tables: Dynamic DNS (when hosts are set), Instances, Domains, each domain's 
 rules, SSH keys, Block storage, Reserved IPs, and The account's other resources. The actions: **Refresh** and **Update
 DNS now**. The forms:
 
-- **Start…** on a stopped instance, **Reboot…** and **Halt…** on a running one. Vultr's docs call a restart a hard
-  reboot: its confirmation says so. A halt is asked a second time ("Halt it anyway?"): Vultr's API has no other way to
+- **Start…** on a stopped instance, **Reboot…** and **Halt…** on a running one. A reboot is asked a second time
+  ("Reboot it anyway?"): Vultr's docs call a restart a hard reboot, its running processes stopped, not shut down, so
+  anything not saved may be lost. A halt is asked a second time too ("Halt it anyway?"): Vultr's API has no other way to
   power an instance off, and its docs differ on how cleanly a halt stops the system, so anything not saved may be lost.
 - **Set a record…** under each domain's records (the name, the type, the data, the TTL, and for MX and SRV the
   priority), and **Remove…** on each record. An A, AAAA or CNAME replaces the host's records of its type (the first one
@@ -107,13 +109,14 @@ not valid, its `why` saying so and where to set it; a read that failed is taken 
 ## Its hooks
 
 `present`, `status` (the summary, the facts, `tables`, `actions`, `forms`), `refresh()`, `balance()`, `servers()`,
-`domains()`, `records(domain)`, `firewalls()`, `ssh_keys()`, `start(instance, label="")`, `reboot(instance, label="")`,
+`domains()`, `records(domain)`, `firewalls()`, `ssh_keys()`, `start(instance, label="")`,
+`reboot(instance, label="", accept_reboot=False)`,
 `halt(instance, label="", accept_halt=False)`, `set_record(domain, name, rtype, data, ttl=None, priority=None)`,
 `remove_record(domain, record, name="", rtype="", data="")`,
 `add_rule(group, ip_type, protocol, port, subnet, subnet_size, notes="", accept_risk=False)`,
 `remove_rule(group, rule, protocol="", port="", source="", accept_risk=False)`, `add_key(name, ssh_key)`,
 `remove_key(key, name="")`, `ddns_update(force=True)`. A refusal is a `ValueError` (`records.Refusal`), its `accept`
-naming the argument that accepts it (`accept_halt`, `accept_risk`): the page's second confirmation. A change's answer:
+naming the argument that accepts it (`accept_reboot`, `accept_halt`, `accept_risk`): the page's second confirmation. A change's answer:
 `said`, `lines` (what was sent and the check after it), `ok`.
 
 ## From the command line
@@ -134,7 +137,7 @@ python -m plugin_platform_vultr set example.com home A 203.0.113.7 --ttl 300
 python -m plugin_platform_vultr remove example.com home A
 ```
 
-Each change asks `yes` on the terminal first (a halt twice). `--json` before the command prints the answer as JSON. The
+Each change asks `yes` on the terminal first (a reboot and a halt twice). `--json` before the command prints the answer as JSON. The
 firewall rules and the SSH keys are changed from the platform's page.
 
 ## Its API

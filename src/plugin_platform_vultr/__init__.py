@@ -3,7 +3,7 @@
 plan's price a month and an hour, the domains on Vultr's DNS and their records, the firewall groups and their rules, the
 SSH keys, block storage, reserved IPs, and how many bare metal servers, snapshots, backups, Kubernetes clusters, load
 balancers and databases it holds), and the changes that cost nothing, each confirmed on the platform's page: an instance
-started or rebooted, or halted (asked twice); a DNS record set or removed, every other record kept; a firewall rule
+started, or rebooted or halted (each asked twice); a DNS record set or removed, every other record kept; a firewall rule
 added or removed (a risky one asked twice); an SSH key added or removed. Dynamic DNS keeps hosts at this network's public
 IPv4 address through Vultr's DNS. Nothing that starts a charge: no instance, volume, snapshot, backup or reserved IP is
 made, nothing resized, restored or destroyed. A stopped instance still bills: Vultr's docs say stopping an instance does
@@ -49,6 +49,7 @@ ZONES_MAX = 25  # the domains whose records a refresh reads (the rest: `records 
 GROUPS_MAX = 25  # the firewall groups whose rules a refresh reads
 DDNS_TTL = 300  # the TTL of an A record Dynamic DNS makes (the reference's examples' 300 s)
 ACCEPT_HALT = "accept_halt"  # the halt's argument accepting it (Refusal's accept): the page's second confirmation
+ACCEPT_REBOOT = "accept_reboot"  # the reboot's (a hard reboot: asked twice, as a halt is)
 ACCEPT_RISK = walls.ACCEPT  # a risky firewall rule change's
 PUBLIC_IPV4 = (("myip.opendns.com", "a", "208.67.222.222", "OpenDNS"),  # this network's address, asked of these servers
                ("o-o.myaddr.l.google.com", "txt", "216.239.32.10", "Google"))
@@ -68,6 +69,9 @@ HALT_WORDS = ("Halting powers {label} off at once. Vultr's API has no other way 
               "inside it first to be sure. It still bills while it is off: only destroying it ends the charges.")
 REBOOT_WORDS = ("Vultr's docs call a restart a hard reboot: its running processes are stopped, not shut down, so unsaved "
                 "work in them is lost; files on disk stay.")
+REBOOT_ACCEPT_WORDS = ("Rebooting restarts {label} at once, and it is a hard restart: Vultr's docs call a restart a hard "
+                       "reboot, its running processes stopped, not shut down, so anything not saved on it may be lost (its "
+                       "files on disk stay). Save the work, or restart the system from inside it, to be sure.")
 START_WORDS = ("Starting it adds nothing to its charge: Vultr bills an instance hourly from its deployment until it is "
                "destroyed, running or stopped.")
 ID = re.compile(r"^[A-Za-z0-9-]{1,64}$")
@@ -401,9 +405,10 @@ class VultrPlugin(MachinePlugin):
         """An instance started (it was stopped)."""
         return self._power("start", instance, label)
 
-    def reboot(self, instance: str, label: str = "") -> dict:
-        """An instance rebooted (it was running): Vultr's docs call a restart a hard reboot."""
-        return self._power("reboot", instance, label)
+    def reboot(self, instance: str, label: str = "", accept_reboot: bool = False) -> dict:
+        """An instance rebooted (it was running): a hard reboot, Vultr's docs say, so refused until accepted a second time
+        (accept_reboot), as a halt is."""
+        return self._power("reboot", instance, label, bool(accept_reboot))
 
     def halt(self, instance: str, label: str = "", accept_halt: bool = False) -> dict:
         """An instance halted (powered off; still billed): refused until accepted a second time (accept_halt)."""
@@ -428,6 +433,9 @@ class VultrPlugin(MachinePlugin):
         if action == "halt" and not accepted:
             raise Refusal(f"{shown} is halted only once that is accepted a second time ({ACCEPT_HALT}). "
                           + HALT_WORDS.format(label=shown), accept=ACCEPT_HALT)
+        if action == "reboot" and not accepted:
+            raise Refusal(f"{shown} is rebooted only once that is accepted a second time ({ACCEPT_REBOOT}). "
+                          + REBOOT_ACCEPT_WORDS.format(label=shown), accept=ACCEPT_REBOOT)
         api.power(action, iid)
         said = {"start": "started", "reboot": "rebooted", "halt": "halted"}[action]
         lines = [f"asked of Vultr at {time.strftime('%H:%M:%S', time.localtime(self._clock()))}: POST /instances/{iid}/{action}"]
@@ -991,7 +999,7 @@ class VultrPlugin(MachinePlugin):
         return {"title": "Instances",
                 "note": why or (STOPPED_BILLS_SAID + " · prices: the plan's, a month and an hour "
                                 "(Vultr bills hourly, capped at 672 hours a month); started, rebooted and halted here, "
-                                "each confirmed (a halt asked twice)"),
+                                "each confirmed (a reboot and a halt asked twice)"),
                 "columns": [{"title": "Instance"}, {"title": "Power"}, {"title": "Region"}, {"title": "Plan"},
                             {"title": "IPv4"}, {"title": "IPv6"}, {"title": "Per month", "num": True},
                             {"title": "Per hour", "num": True}, {"title": "Created"}, {"title": ""}, {"title": ""}],
@@ -1087,9 +1095,13 @@ class VultrPlugin(MachinePlugin):
             out += [
                 {"id": "start", "hook": "start", "title": "Start an instance", "fields": [instance, label],
                  "confirm": {"title": "Start {label}?", "words": "{label} is started now. " + START_WORDS, "yes": "Start it"}},
-                {"id": "reboot", "hook": "reboot", "title": "Reboot an instance", "fields": [instance, label],
-                 "confirm": {"title": "Reboot {label}?", "words": "{label} is rebooted now. " + REBOOT_WORDS,
-                             "yes": "Reboot it", "danger": True}},
+                {"id": "reboot", "hook": "reboot", "title": "Reboot an instance",
+                 "fields": [instance, label,
+                            {"name": ACCEPT_REBOOT, "type": "accept", "title": "Reboot it anyway?", "yes": "Reboot it",
+                             "words": REBOOT_ACCEPT_WORDS}],
+                 "confirm": {"title": "Reboot {label}?", "words": "{label} is rebooted now. " + REBOOT_WORDS
+                                      + " You are asked again before it goes.",
+                             "yes": "Go on", "danger": True}},
                 {"id": "halt", "hook": "halt", "title": "Halt an instance",
                  "fields": [instance, label,
                             {"name": ACCEPT_HALT, "type": "accept", "title": "Halt it anyway?", "yes": "Halt it",

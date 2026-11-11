@@ -254,7 +254,12 @@ def test_the_command_line(made, env):
     assert fake.instances[0]["power_status"] == "running"
     assert run("power", "web-1", "off", say=["yes", "yes"]) == 0 and lines[0] == "web-1 halted"
     assert fake.instances[0]["power_status"] == "stopped"
-    assert run("power", "web-1", "on", say=["yes"]) == 0 and lines[0] == "web-1 started"
+    assert run("power", "web-1", "on", say=["yes"]) == 0 and lines[0] == "web-1 started"  # a start: asked once
+    n = len(fake.writes())
+    assert run("power", "web-1", "reboot", say=["yes"]) == 1 and errors == ["nothing done"]  # a reboot is asked twice
+    assert len(fake.writes()) == n
+    assert run("power", "web-1", "reboot", say=["yes", "yes"]) == 0 and lines[0] == "web-1 rebooted"
+    assert fake.writes()[-1][:2] == ("POST", f"/instances/{WEB}/reboot")
     assert run("--json", "status") == 0 and json.loads("\n".join(lines))["valid"] is True
     fake.refuse_ip = HOME
     assert run("domains") == 1 and errors[0].startswith("vultr: GET /v2/domains: HTTP 401: Unauthorized IP address")

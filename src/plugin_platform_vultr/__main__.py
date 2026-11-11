@@ -9,12 +9,13 @@ EnvironmentLogin: the variables as this shell has them).
     firewalls                                the firewall groups and their rules
     keys                                     the account's SSH keys
     ddns [--now]                             a Dynamic DNS pass: a host's record set where it differs (--now: every host)
-    power NAME on|off|reboot                 an instance started, halted (asked twice) or rebooted: NAME its label or ID
+    power NAME on|off|reboot                 an instance started, or halted or rebooted (each asked twice): NAME its
+                                             label or ID
     set DOMAIN NAME TYPE DATA [--ttl N] [--priority N]
                                              a record set, every other record kept
     remove DOMAIN NAME TYPE [DATA]           a record removed, the rest kept
 
-Each change asks "yes" on the terminal first (a halt twice); --json prints the answer as JSON. The firewall rules and the
+Each change asks "yes" on the terminal first (a halt and a reboot twice); --json prints the answer as JSON. The firewall rules and the
 SSH keys are changed from the platform's page."""
 from __future__ import annotations
 
@@ -22,7 +23,8 @@ import argparse
 import json
 import sys
 
-from . import HALT_WORDS, MACHINE, REBOOT_WORDS, START_WORDS, STOPPED_BILLS_SAID, money, name_of, when
+from . import (HALT_WORDS, MACHINE, REBOOT_ACCEPT_WORDS, REBOOT_WORDS, START_WORDS, STOPPED_BILLS_SAID, money, name_of,
+               when)
 from . import records as zones
 from .api import RestError
 
@@ -133,10 +135,11 @@ def main(argv: list[str] | None = None, plugin=None, out=None, err=None, ask=Non
             if not confirmed(ask, words):
                 tell("nothing done")
                 return 1
-            if action == "halt" and not confirmed(ask, HALT_WORDS.format(label=label) + " Asked a second time:"):
+            second = {"halt": HALT_WORDS, "reboot": REBOOT_ACCEPT_WORDS}.get(action)
+            if second and not confirmed(ask, second.format(label=label) + " Asked a second time:"):
                 tell("nothing done")
                 return 1
-            answer = getattr(p, action)(str(inst.get("id")), label, *([True] if action == "halt" else []))
+            answer = getattr(p, action)(str(inst.get("id")), label, *([True] if second else []))
             lines = report_lines(answer)
         elif what == "set":
             if not confirmed(ask, f"{args.name} {args.type.upper()} {args.data} is set in {args.domain}; every other record "

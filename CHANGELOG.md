@@ -18,9 +18,9 @@ about"). Plugin API 2.2; needs liminal-libs>=1.49.0.
   their records, the firewall groups and their rules, the SSH keys, block storage, reserved IPs, and the counts of bare
   metal servers, snapshots, backups, Kubernetes clusters, load balancers and managed databases (a page of one each).
   A part the key may not read is said beside the rest.
-- The free changes, each through a form the platform's page confirms: an instance started, rebooted (Vultr's "hard
-  reboot", said) or halted (asked twice; a halted instance still bills: Vultr's docs say stopping does not halt
-  billing); a DNS record set (created, or its own record updated; an A, AAAA or CNAME replacing the host's others of
+- The free changes, each through a form the platform's page confirms: an instance started; rebooted (asked twice: a
+  hard restart, Vultr's docs call it a hard reboot, so unsaved data may be lost) or halted (asked twice; a halted
+  instance still bills: Vultr's docs say stopping does not halt billing); a DNS record set (created, or its own record updated; an A, AAAA or CNAME replacing the host's others of
   its type) or removed by its ID once it is the one shown, every other record kept, the zone read before and after; a
   firewall rule added or removed, a risky one asked twice (SSH or every port open to the whole internet, a group's
   first rule while instances are linked, its last rule, the only rule letting SSH in); an SSH key added or removed.
@@ -37,4 +37,4 @@ about"). Plugin API 2.2; needs liminal-libs>=1.49.0.
   VULTR_DDNS_MINUTES (5) in a thread of its own; detached, nothing runs. Valid while the key is set and its last read
   worked or is untried.
 - `python -m plugin_platform_vultr status | account | servers | domains | records | firewalls | keys | ddns | power | set
-  | remove` (each change asking `yes` first, a halt twice).
+  | remove` (each change asking `yes` first, a reboot and a halt twice).

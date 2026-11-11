@@ -9,7 +9,7 @@ import inspect
 import pytest
 
 from conftest import DB, G_EMPTY, G_LONE, G_WEB, HOME, NEW, WEB, FakeVultr, public_key, settings_of
-from plugin_platform_vultr import ACCEPT_HALT, ACCEPT_RISK
+from plugin_platform_vultr import ACCEPT_HALT, ACCEPT_REBOOT, ACCEPT_RISK
 from plugin_platform_vultr.records import Refusal
 
 
@@ -62,6 +62,10 @@ def test_every_form_takes_its_hooks_arguments_in_order_and_names_its_change(made
     (accept,) = [x for x in forms["halt"]["fields"] if x["type"] == "accept"]
     assert accept["name"] == ACCEPT_HALT and "may be lost" in accept["words"] and "{label}" in accept["words"]
     assert "hard reboot" in forms["reboot"]["confirm"]["words"] and forms["reboot"]["confirm"]["danger"] is True
+    assert "asked again" in forms["reboot"]["confirm"]["words"]
+    (again,) = [x for x in forms["reboot"]["fields"] if x["type"] == "accept"]
+    assert again["name"] == ACCEPT_REBOOT and "hard restart" in again["words"] and "may be lost" in again["words"]
+    assert "{label}" in again["words"] and not [x for x in forms["start"]["fields"] if x["type"] == "accept"]  # start: once
     assert "adds nothing to its charge" in forms["start"]["confirm"]["words"]
     s = forms["set:example.com"]
     assert [c["value"] for c in next(x for x in s["fields"] if x["name"] == "rtype")["choices"]] == [
@@ -88,8 +92,13 @@ def test_start_and_reboot_send_the_references_requests(made, env):
     assert rep["ok"] and rep["said"] == "db-1 started" and rep["lines"][1].startswith("Vultr says now: running")
     reboot = button(p.status(), "Instances", "reboot", instance=WEB)
     n = len(fake.requests)
-    assert p.ask("reboot", *page_args(forms["reboot"], reboot["values"]))["said"] == "web-1 rebooted"
-    assert since(fake, n)[1] == ("POST", f"/instances/{WEB}/reboot", None)
+    with pytest.raises(Refusal, match="rebooted only once that is accepted") as refused:
+        p.ask("reboot", *page_args(forms["reboot"], reboot["values"]))  # a hard restart: the first confirmation is not enough
+    assert refused.value.accept == ACCEPT_REBOOT and "hard restart" in str(refused.value) and "may be lost" in str(refused.value)
+    assert since(fake, n) == [("GET", f"/instances/{WEB}", None)]
+    n = len(fake.requests)
+    rep = p.ask("reboot", *page_args(forms["reboot"], reboot["values"], accepted={ACCEPT_REBOOT}))
+    assert rep["said"] == "web-1 rebooted" and since(fake, n)[1] == ("POST", f"/instances/{WEB}/reboot", None)
     # what the plugin refuses comes back in its words, nothing sent: a server already running, one not active yet, a
     # server renamed since the page showed it
     n = len(fake.requests)
