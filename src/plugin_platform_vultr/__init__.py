@@ -866,7 +866,7 @@ class VultrPlugin(MachinePlugin):
 
     def _maybe_start(self) -> None:
         """The background started when the platform holds the plugin (its app's NAME) and it is set up."""
-        if getattr(self.app, "NAME", "") != "platform":
+        if getattr(self.app, "NAME", "") != "platform" or getattr(self.app, "once", False):  # nor a one-shot command's
             return
         try:
             ready = self.config().api_ready

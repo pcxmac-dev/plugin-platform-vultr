@@ -381,3 +381,15 @@ def test_a_key_of_a_limited_user_says_its_permissions(made, env):
     assert st["keyPermissions"] == "subscriptions_view, subscriptions, dns, firewall"
     assert [r[0] for r in table(st, "SSH keys")["rows"]] == ["laptop", "ci"]
     assert G_WEB in {f["id"].split(":", 1)[1] for f in st["forms"] if f["id"].startswith("rule-add:")}
+
+
+def test_the_platforms_one_shot_command_starts_nothing(made):
+    """The platform's status and machine commands attach it to answer and end (PlatformApp.once, liminal-platform
+    0.20.1): nothing of it runs on its own then."""
+    p, fake = made()
+    p.attach(type("Once", (), {"NAME": "platform", "once": True})(), Pairs(settings_of(ddns=True)))
+    try:
+        time.sleep(0.1)
+        assert not p.working and fake.requests == []
+    finally:
+        p.detach()

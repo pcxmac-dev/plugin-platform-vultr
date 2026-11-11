@@ -33,6 +33,8 @@ finding; FIX-clouds.md), fixed. Needs liminal-libs>=1.49.2.
 - The key field of Add a key… is marked `secret` (for the platform, which logs a hook's arguments: the audit's blocker
   there is the platform's to fix).
 
+The platform's one-shot commands (status, machine: `PlatformApp.once`, liminal-platform 0.20.1) start none of its background work.
+
 ## 0.1.0 (2026-11-11)
 
 The first release (the user: "lets roll plugins for EC2, vultr, azure and google cloud"; for the clouds, "Free changes
