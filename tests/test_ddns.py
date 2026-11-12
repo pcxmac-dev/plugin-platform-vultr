@@ -14,6 +14,7 @@ import time
 import pytest
 
 import plugin_platform_vultr.settings as settings_mod
+import plugin_platform_vultr.__main__ as cli
 from conftest import HOME, App, FakeVultr, Pairs, settings_of
 from liminal_libs.machines.ddns import TakeOverRefused
 from plugin_platform_vultr import DDNS_TTL, PUBLIC_IPV4
@@ -26,6 +27,13 @@ NEW_HOME = "93.184.216.99"
 def ddns(made, env, fake=None, public=HOME, folder=None, **more):
     env(settings_of(ddns=True, **more))
     return made(fake, public=public, folder=folder)
+
+
+def serving(p):
+    """The plugin as the serving platform holds it (only that one settles: FIX3), with no thread of its own started: the
+    test drives each pass itself."""
+    p.app = App("platform")
+    return p
 
 
 def ddns_table(status: dict) -> dict:
@@ -82,7 +90,8 @@ def test_take_over_then_a_pass_sets_it(made, env):
     assert rep["ok"] and rep["said"] == "home.example.com taken over: set (was 198.51.100.7)"
     assert fake.writes() == [("PATCH", f"/domains/example.com/records/{HOME_ID}", {"data": HOME})]
     kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
-    assert kept == {"own": {"home.example.com": HOME}, "taken": ["home.example.com"]}
+    assert kept == {"own": {"home.example.com": HOME}, "taken": []}  # the consent used up once its write landed (1.49.8)
+    assert p.keeper().own("home.example.com") == HOME and not p.keeper().taken("home.example.com")  # its own from now on
     assert p.ddns_update(force=False)["hosts"][0]["result"] == "current" and len(fake.writes()) == 1
 
 
@@ -167,13 +176,14 @@ def test_a_host_taken_over_then_out_of_the_setting_is_let_go_and_comes_back_as_n
     t = [1_000_000.0]
     now = [HOME]
     p, fake = ddns(made, env, public=lambda: now[0], VULTR_DDNS_HOSTS="@.example.net, home.example.com")
+    serving(p)
     p._clock = lambda: t[0]
     p.ddns_update(force=False)  # example.net made (its own); home holds another address: left
     p.ask("ddns_take_over", "home.example.com", "198.51.100.7", True)
-    assert p.keeper().known() == ["example.net", "home.example.com"] and p.keeper().taken("home.example.com")
+    assert p.keeper().known() == ["example.net", "home.example.com"] and p.keeper().own("home.example.com") == HOME
     monkeypatch.setenv("VULTR_DDNS_HOSTS", "@.example.net")  # home taken out of the setting
     p.ddns_update(force=False)
-    assert p.keeper().known() == ["example.net"] and not p.keeper().taken("home.example.com")
+    assert p.keeper().known() == ["example.net"] and p.keeper().own("home.example.com") is None
     kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
     assert kept == {"own": {"example.net": HOME}, "taken": []}
     writes = len(fake.writes())
@@ -187,7 +197,6 @@ def test_a_host_taken_over_then_out_of_the_setting_is_let_go_and_comes_back_as_n
     row = next(r for r in ddns_table(p.status())["rows"] if r[0] == "home.example.com")
     assert row[-1]["form"] == "ddns-take" and row[-1]["values"] == {"host": "home.example.com", "holds": HOME}
     monkeypatch.delenv("VULTR_DDNS_HOSTS")  # no host set at all: the next refresh settles against the whole, empty setting
-    p.settings_changed()
     p.refresh()
     assert p.keeper().known() == [] and json.loads(p.ddns_file().read_text(encoding="utf-8")) == {"own": {}, "taken": []}
 
@@ -195,16 +204,39 @@ def test_a_host_taken_over_then_out_of_the_setting_is_let_go_and_comes_back_as_n
 def test_the_setting_is_settled_only_once_the_domains_are_read(made, env, monkeypatch):
     """Never against an unread list: a refresh whose domains are not read lets nothing go."""
     p, fake = ddns(made, env, VULTR_DDNS_HOSTS="@.example.net")
+    serving(p)
     p.ddns_update(force=False)
     assert p.keeper().known() == ["example.net"]
-    monkeypatch.delenv("VULTR_DDNS_HOSTS")
-    p.settings_changed()
+    monkeypatch.delenv("VULTR_DDNS_HOSTS")  # read afresh by the refresh itself
     fake.fail[("GET", "/domains")] = (403, "Unauthorized")
     p.refresh()  # the domains not read: nothing settled
     assert p.keeper().known() == ["example.net"]
     del fake.fail[("GET", "/domains")]
     p.refresh()
     assert p.keeper().known() == []
+
+
+def test_only_the_serving_platform_settles(made, env, monkeypatch):
+    """The plugin's own command line runs from a shell whose setting may lack VULTR_DDNS_HOSTS: unattached (or under a
+    one-shot platform command) nothing is let go, so the shared ddns.json keeps every own record (FIX3). Under the
+    serving platform, settle lets go as before."""
+    p, fake = ddns(made, env, VULTR_DDNS_HOSTS="@.example.net")
+    p.ddns_update(force=False)  # the command line's own pass: example.net made, its own
+    kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
+    assert kept == {"own": {"example.net": HOME}, "taken": []}
+    monkeypatch.delenv("VULTR_DDNS_HOSTS")  # a shell without the setting
+    p.settings_changed()
+    lines = []
+    assert cli.main(["status"], plugin=p, out=lines.append, err=lines.append) == 0  # its refresh: nothing settled
+    p.refresh()
+    assert p.keeper().known() == ["example.net"] and json.loads(p.ddns_file().read_text(encoding="utf-8")) == kept
+    p.app = App("platform")
+    p.app.once = True  # a one-shot platform command (status, machine): no settle either
+    p.refresh()
+    assert p.keeper().known() == ["example.net"]
+    p.app.once = False  # the serving platform: the whole, empty setting settled
+    p.refresh()
+    assert p.keeper().known() == [] and json.loads(p.ddns_file().read_text(encoding="utf-8")) == {"own": {}, "taken": []}
 
 
 def test_a_pass_under_way_writes_nothing_once_the_plugin_is_detached(made, monkeypatch):

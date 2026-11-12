@@ -13,6 +13,10 @@ What the re-verification of the audit's fixes found in Dynamic DNS (FIX2-clouds.
   whole setting, once the account's domains are read (never a partial or unread list), in each Dynamic DNS pass and each
   refresh. Put back later, a host that holds another address is left as it is, its row offering Take over… again.
   `settle` replaces the plugin's own letting go.
+- The third round (FIX3-clouds.md), with liminal-libs 1.49.8 (needed now): a take-over is single-use, its consent used
+  up once its write lands (the host is the keeper's own from then on); and only the serving platform settles: the
+  plugin's own command line, a one-shot platform command or an unattached plugin never does, since a shell's setting may
+  lack VULTR_DDNS_HOSTS and would empty the shared ddns.json.
 
 ## 0.1.1 (2026-11-11)
 

@@ -786,9 +786,14 @@ class VultrPlugin(MachinePlugin):
 
     def _settle(self, cfg: Config) -> list[str]:
         """Every host the keeper holds (its own, or taken over) that the whole setting no longer names, let go
-        (Keeper.settle, liminal-libs 1.49.7): asked only once the account's domains are read, never with a partial or an
-        unread list, so a host taken out of the setting, while the plugin ran or not, comes back as not its own. The
-        hosts let go."""
+        (Keeper.settle, liminal-libs 1.49.7): asked only by the serving platform's plugin (never from the plugin's own
+        command line, a one-shot platform command, nor unattached: a shell's setting may lack VULTR_DDNS_HOSTS, and
+        settling there would empty the shared ddns.json, forgetting every own record), and only once the account's
+        domains are read, never with a partial or an unread list. A host taken out of the setting, while the plugin ran
+        or not, comes back as not its own. The hosts let go."""
+        app = self.app
+        if app is None or getattr(app, "NAME", "") != "platform" or getattr(app, "once", False):
+            return []  # only the serving platform settles
         with self._rt.lock:
             read = self._rt.read.get("domains") is not None
         if not read or self._stopping():

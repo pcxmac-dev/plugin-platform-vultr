@@ -9,9 +9,9 @@ description = "Vultr for Liminal's platform: your account through Vultr's API v2
 readme = "README.md"
 requires-python = ">=3.10"
 # the library it plugs into (the machine kind and plugin API 2.2: liminal_libs.machines, its REST client over the
-# library's requests and its Dynamic DNS keeper changing only what is its own, taking over asked twice, 1.49.7; the
-# Login interface)
-dependencies = ["liminal-libs>=1.49.7"]
+# library's requests and its Dynamic DNS keeper changing only what is its own, a take-over asked twice and
+# single-use, 1.49.8; the Login interface)
+dependencies = ["liminal-libs>=1.49.8"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]

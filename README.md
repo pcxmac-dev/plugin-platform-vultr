@@ -116,8 +116,10 @@ Any other host, one holding another address or several, is **left as it is** and
 network's address"), its row offering Take over…; several addresses are never cut to one unasked. **Update DNS now**
 (confirmed) sets every host that is its own, even where it already holds the address. The address is asked again just
 before a write, and nothing is written if it changed meanwhile. A host taken out of the setting is let go, while
-the plugin ran or not (each pass and each refresh settle the keeper against the whole setting, once the account's
-domains are read): put back later, one holding another address is left as it is until taken over again. A host that
+the plugin ran or not (each pass and each refresh of the serving platform settle the keeper against the whole
+setting, once the account's domains are read; the command line never does, its shell's setting may lack the hosts): put
+back later, one holding another address is left as it is until taken over again. A take-over is single-use: once its
+write lands the host is Dynamic DNS's own, kept current by that rule. A host that
 is a CNAME, or in no domain on the account's Vultr DNS, is said, not touched. Dynamic DNS goes through the API, so it
 needs the key too.
 
