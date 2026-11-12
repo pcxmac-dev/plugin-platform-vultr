@@ -44,7 +44,7 @@ from .card import APIS, VULTR_API
 from .records import TYPES, Refusal
 from .settings import ACCESS_CONTROL, API_KEY, CONSOLE_API, DDNS_HOSTS, KEYS, NAMES, WHERE_KEY, Config
 
-__version__ = "0.1.2"
+__version__ = "0.1.3"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
