@@ -7,6 +7,9 @@ up once its write lands (the host is the keeper's own from then on); and only th
 plugin's own command line, a one-shot platform command or an unattached plugin never does, since a shell's setting may
 lack VULTR_DDNS_HOSTS and would empty the shared ddns.json.
 
+Needs liminal-libs>=1.49.9: a take-over's consent is bound to the addresses it drops (a record changed after
+a failed write is asked about again); the state file keeps each take-over's addresses.
+
 ## 0.1.2 (2026-11-11)
 
 What the re-verification of the audit's fixes found in Dynamic DNS (FIX2-clouds.md), fixed with liminal-libs 1.49.7

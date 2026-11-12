@@ -11,7 +11,7 @@ requires-python = ">=3.10"
 # the library it plugs into (the machine kind and plugin API 2.2: liminal_libs.machines, its REST client over the
 # library's requests and its Dynamic DNS keeper changing only what is its own, a take-over asked twice and
 # single-use, 1.49.8; the Login interface)
-dependencies = ["liminal-libs>=1.49.8"]
+dependencies = ["liminal-libs>=1.49.9"]
 
 [project.optional-dependencies]
 dev = ["pytest>=8"]
