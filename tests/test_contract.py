@@ -23,8 +23,8 @@ def test_every_plugin_here_conforms_to_the_class_contract():
     assert found and all(p.api == "2.2" and not p.is_record for p in found)
     assert {p.SYSTEM for p in found} == {"platform"} and {p.KIND for p in found} == {"machine"}
     assert {(p.name, p.title, p.order, p.ICON) for p in found} == {("vultr", "Vultr", 762, "vultr")}
-    assert module.__version__ == "0.1.1"
-    assert 'version = "0.1.1"' in (PACKAGE.parents[1] / "pyproject.toml").read_text(encoding="utf-8")
+    assert module.__version__ == "0.1.2"
+    assert 'version = "0.1.2"' in (PACKAGE.parents[1] / "pyproject.toml").read_text(encoding="utf-8")
 
 
 def test_its_settings_are_pairs_named_by_their_variables():
@@ -135,7 +135,7 @@ def test_the_hooks_the_forms_ask_take_their_fields_in_order():
                          ("halt", ["instance", "label", "accept_halt"]),
                          ("set_record", ["domain", "name", "rtype", "data", "ttl", "accept_replace"]),
                          ("add_record", ["domain", "name", "rtype", "data", "ttl", "priority"]),
-                         ("ddns_take_over", ["host", "holds"]), ("ddns_update", ["force"]),
+                         ("ddns_take_over", ["host", "holds", "accept_take_over"]), ("ddns_update", ["force"]),
                          ("remove_record", ["domain", "record", "name", "rtype", "data"]),
                          ("add_rule", ["group", "ip_type", "protocol", "port", "subnet", "subnet_size", "notes", "accept_risk"]),
                          ("remove_rule", ["group", "rule", "protocol", "port", "source", "accept_risk"]),

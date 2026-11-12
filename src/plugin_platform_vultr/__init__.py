@@ -25,7 +25,6 @@ status is what was read last (no request is made to answer it): the platform's p
 """
 from __future__ import annotations
 
-import json
 import os
 import re
 import threading
@@ -45,7 +44,7 @@ from .card import APIS, VULTR_API
 from .records import TYPES, Refusal
 from .settings import ACCESS_CONTROL, API_KEY, CONSOLE_API, DDNS_HOSTS, KEYS, NAMES, WHERE_KEY, Config
 
-__version__ = "0.1.1"
+__version__ = "0.1.2"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -368,6 +367,8 @@ class VultrPlugin(MachinePlugin):
             rt.notes = {}
             rt.api_ok, rt.api_error, rt.api_error_at, rt.api_print = True, "", None, cfg.api_print
             rt.trouble, rt.trouble_at = "", None
+        if "domains" in got:
+            self._settle(cfg)  # the whole setting known, the domains read: a host taken out of it let go
         return {"instances": len(got.get("instances") or []), "domains": len(got.get("domains") or []),
                 "groups": len(got.get("groups") or []), "notRead": sorted(why), "refreshedAt": when(now)}
 
@@ -771,28 +772,31 @@ class VultrPlugin(MachinePlugin):
                 pass  # said by each host as it is checked
         return keeping.hosts_of(cfg.hosts, self.known())
 
-    def _let_go_removed(self, cfg: Config) -> list[str]:
-        """The hosts the keeper holds (in this run, or in its state file) that are no longer in the settings, let go of:
-        neither its own nor taken over any more. Their names, in order."""
-        wanted = set()
+    @staticmethod
+    def setting_names(cfg: Config) -> list[str]:
+        """Every host the Dynamic DNS setting names, whole, as the keeper names them (@.example.com is example.com),
+        whether or not its domain is among the account's."""
+        out: list[str] = []
         for part in cfg.hosts.replace(";", ",").replace(" ", ",").split(","):
             n = part.strip().rstrip(".").lower()
-            if n:
-                wanted.add(n[2:] if n.startswith("@.") else n)
-        keeper = self.keeper()
-        held = {s.fqdn for s in keeper.states()}
-        try:
-            data = json.loads(self.ddns_file().read_text(encoding="utf-8"))
-            held |= {str(k).lower() for k in (data.get("own") or {})} | {str(k).lower() for k in (data.get("taken") or [])}
-        except (OSError, ValueError, AttributeError):
-            pass
-        gone = sorted(h for h in held if h not in wanted)
-        for fqdn in gone:
-            keeper.let_go(fqdn)
-        return gone
+            n = n[2:] if n.startswith("@.") else n
+            if n and n not in out:
+                out.append(n)
+        return out
+
+    def _settle(self, cfg: Config) -> list[str]:
+        """Every host the keeper holds (its own, or taken over) that the whole setting no longer names, let go
+        (Keeper.settle, liminal-libs 1.49.7): asked only once the account's domains are read, never with a partial or an
+        unread list, so a host taken out of the setting, while the plugin ran or not, comes back as not its own. The
+        hosts let go."""
+        with self._rt.lock:
+            read = self._rt.read.get("domains") is not None
+        if not read or self._stopping():
+            return []
+        return self.keeper().settle(self.setting_names(cfg))
 
     def _ddns_pass(self, cfg: Config, hosts: list, force: bool = False, wait: float = 120.0, stop=None) -> list[dict]:
-        self._let_go_removed(cfg)
+        self._settle(cfg)
         out = self.keeper().run_pass(hosts, force=bool(force), wait=wait, stop=stop)
         with self._rt.lock:
             self._rt.ddns_print, self._rt.ddns_at = cfg.ddns_print, self._clock()
@@ -813,10 +817,12 @@ class VultrPlugin(MachinePlugin):
         return {"said": f"Dynamic DNS: {current} of {plural(len(out), 'host')} current", "ok": current == len(out),
                 "lines": [f"{h['host']}: {h['result']}" for h in out] + [f"not kept: {w}" for w in wrong], "hosts": out}
 
-    def ddns_take_over(self, host: str, holds=None) -> dict:
-        """A host let be taken over (the page's Take over…, once confirmed: its confirmation named what the record holds
-        and that it will point here), then a pass for it: its A record set to this network's address alone. Refused when
-        it is none of the hosts set, or holds now what the page did not show (`holds`)."""
+    def ddns_take_over(self, host: str, holds=None, accept_take_over=False) -> dict:
+        """A host let be taken over (the page's Take over…, confirmed twice: its confirmation named what the record holds
+        and that it will point here; its second, `accept_take_over`, True itself, that every address it holds is
+        dropped), then a pass for it: its A record set to this network's address alone. Refused when it is none of the
+        hosts set, or holds now what the page did not show (`holds`); without the second confirmation, the keeper's
+        TakeOverRefused names it, and nothing is taken."""
         cfg = self.config(fresh=True)
         if not cfg.ddns_ready:
             raise ValueError("Dynamic DNS is not set up: " + ("; ".join(cfg.incomplete) or f"{DDNS_HOSTS} is not set"))
@@ -832,8 +838,9 @@ class VultrPlugin(MachinePlugin):
                 raise Refusal(f"{h.fqdn} holds {', '.join(now) or 'no A record'} now, not {holds}: nothing taken over (the "
                               "page shows it as read now)")
         keeper = self.keeper()
-        keeper.take_over(h.fqdn)
-        out = self._ddns_pass(cfg, [h], force=False)
+        keeper.take_over(h.fqdn, accept=accept_take_over,
+                         holds=str(holds).strip() if holds not in (None, "") else (", ".join(now) or "no A record"))
+        out = self._ddns_pass(cfg, [h], force=False)  # both confirmations given: the pass for that host now
         st = out[0] if out else {"result": "not checked", "ok": None}
         return {"said": f"{h.fqdn} taken over: {st['result']}", "ok": st.get("ok"), "host": h.fqdn,
                 "lines": [f"it held {', '.join(now) or 'no A record'}; Dynamic DNS keeps it at this network's address from "

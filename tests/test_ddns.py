@@ -2,7 +2,9 @@
 home within a minute, unasked): it changes only what is its own, a host with no A record (made), one already pointing at
 this network or at the address it set last (kept current, after a restart too), and one the user took over on the page.
 A host holding another address, or several, is left as it is, its row offering Take over…; several addresses are never
-cut to one unasked. Update DNS now is a confirmed form. A pass ends once the plugin is detached. Over the stand-ins alone."""
+cut to one unasked. Taking a host over is asked twice (0.1.2, the re-verification: it drops what the record holds at
+once). A host taken out of the setting is let go, and comes back as not its own. Update DNS now is a confirmed form. A
+pass ends once the plugin is detached. Over the stand-ins alone."""
 from __future__ import annotations
 
 import json
@@ -13,6 +15,7 @@ import pytest
 
 import plugin_platform_vultr.settings as settings_mod
 from conftest import HOME, App, FakeVultr, Pairs, settings_of
+from liminal_libs.machines.ddns import TakeOverRefused
 from plugin_platform_vultr import DDNS_TTL, PUBLIC_IPV4
 from plugin_platform_vultr.records import Refusal
 
@@ -50,6 +53,7 @@ def test_a_host_holding_another_address_is_left_as_it_is_its_row_offering_take_o
                        "values": {"host": "home.example.com", "holds": "198.51.100.7"}}
     forms = {f["id"]: f for f in st["forms"]}
     assert forms["ddns-take"]["hook"] == "ddns_take_over" and forms["ddns-take"]["confirm"]["danger"] is True
+    assert [x["name"] for x in forms["ddns-take"]["fields"]] == ["host", "holds", "accept_take_over"]  # asked twice
     assert "stops answering at {host}" in forms["ddns-take"]["confirm"]["words"]
     assert forms["ddns-now"]["hook"] == "ddns_update" and forms["ddns-now"]["fields"] == []
     assert {"form": "ddns-now", "title": "Update DNS now"} in st["actions"]
@@ -67,7 +71,14 @@ def test_take_over_then_a_pass_sets_it(made, env):
     with pytest.raises(Refusal, match="none of VULTR_DDNS_HOSTS"):
         p.ask("ddns_take_over", "www.example.com", "")
     assert all(m == "GET" for m, path, q, b in fake.requests[n:])
-    rep = p.ask("ddns_take_over", *take["values"].values())
+    with pytest.raises(TakeOverRefused) as refused:  # one yes is not enough: what it holds is dropped at once
+        p.ask("ddns_take_over", *take["values"].values())
+    assert refused.value.accept == "accept_take_over" and "198.51.100.7" in str(refused.value)
+    for not_true in ("true", 1, "yes"):
+        with pytest.raises(TakeOverRefused):
+            p.ask("ddns_take_over", "home.example.com", "198.51.100.7", not_true)
+    assert fake.writes() == [] and not p.keeper().taken("home.example.com") and p.keeper().known() == []
+    rep = p.ask("ddns_take_over", *take["values"].values(), True)  # True itself: the page's second confirmation
     assert rep["ok"] and rep["said"] == "home.example.com taken over: set (was 198.51.100.7)"
     assert fake.writes() == [("PATCH", f"/domains/example.com/records/{HOME_ID}", {"data": HOME})]
     kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
@@ -84,7 +95,7 @@ def test_a_host_with_several_addresses_is_never_cut_to_one_unasked(made, env):
         (home,) = p.ddns_update(force=force)["hosts"]
         assert home["result"].startswith(f"holds 2 addresses (198.51.100.7, {HOME}): left as it is")
     assert fake.writes() == []
-    rep = p.ask("ddns_take_over", "home.example.com", f"198.51.100.7, {HOME}")  # taken over: what it holds is dropped
+    rep = p.ask("ddns_take_over", "home.example.com", f"198.51.100.7, {HOME}", True)  # taken over: what it holds dropped
     assert rep["ok"] and fake.writes() == [("PATCH", f"/domains/example.com/records/{HOME_ID}", {"data": HOME}),
                                            ("DELETE", "/domains/example.com/records/a0a0a0a0-0000-4000-8000-000000000007",
                                             None)]
@@ -149,17 +160,51 @@ def test_the_hosts_are_matched_once_the_domains_are_read(made, env):
     assert fake.requests == []
 
 
-def test_a_host_taken_out_of_the_settings_is_let_go(made, env, monkeypatch):
-    p, fake = ddns(made, env, VULTR_DDNS_HOSTS="@.example.net, home.example.com")
+def test_a_host_taken_over_then_out_of_the_setting_is_let_go_and_comes_back_as_not_its_own(made, env, monkeypatch):
+    """Settled against the whole setting once the domains are read (Keeper.settle): a host taken out of it is let go by
+    the next pass; put back later, holding what is no longer this network's address, it is left as it is, its row
+    offering Take over… again. A refresh settles too: with no host set, nothing is held."""
+    t = [1_000_000.0]
+    now = [HOME]
+    p, fake = ddns(made, env, public=lambda: now[0], VULTR_DDNS_HOSTS="@.example.net, home.example.com")
+    p._clock = lambda: t[0]
+    p.ddns_update(force=False)  # example.net made (its own); home holds another address: left
+    p.ask("ddns_take_over", "home.example.com", "198.51.100.7", True)
+    assert p.keeper().known() == ["example.net", "home.example.com"] and p.keeper().taken("home.example.com")
+    monkeypatch.setenv("VULTR_DDNS_HOSTS", "@.example.net")  # home taken out of the setting
     p.ddns_update(force=False)
-    p.ask("ddns_take_over", "home.example.com", "198.51.100.7")
-    kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
-    assert set(kept["own"]) == {"example.net", "home.example.com"} and kept["taken"] == ["home.example.com"]
-    monkeypatch.setenv("VULTR_DDNS_HOSTS", "@.example.net")
-    p.ddns_update(force=False)
+    assert p.keeper().known() == ["example.net"] and not p.keeper().taken("home.example.com")
     kept = json.loads(p.ddns_file().read_text(encoding="utf-8"))
     assert kept == {"own": {"example.net": HOME}, "taken": []}
-    assert p.keeper().own("home.example.com") is None and not p.keeper().taken("home.example.com")
+    writes = len(fake.writes())
+    now[0], t[0] = NEW_HOME, t[0] + 601  # this network's address changes meanwhile
+    monkeypatch.setenv("VULTR_DDNS_HOSTS", "@.example.net, home.example.com")  # home put back
+    out = {h["host"]: h for h in p.ddns_update(force=False)["hosts"]}
+    assert out["home.example.com"]["foreign"] is True and out["home.example.com"]["result"].startswith(
+        f"holds {HOME}, not this network's address: left as it is")  # no longer its own: not followed to the new address
+    assert out["example.net"]["result"] == f"set (was {HOME})"  # still its own: followed
+    assert [w for w in fake.writes()[writes:] if "example.com" in w[1]] == []
+    row = next(r for r in ddns_table(p.status())["rows"] if r[0] == "home.example.com")
+    assert row[-1]["form"] == "ddns-take" and row[-1]["values"] == {"host": "home.example.com", "holds": HOME}
+    monkeypatch.delenv("VULTR_DDNS_HOSTS")  # no host set at all: the next refresh settles against the whole, empty setting
+    p.settings_changed()
+    p.refresh()
+    assert p.keeper().known() == [] and json.loads(p.ddns_file().read_text(encoding="utf-8")) == {"own": {}, "taken": []}
+
+
+def test_the_setting_is_settled_only_once_the_domains_are_read(made, env, monkeypatch):
+    """Never against an unread list: a refresh whose domains are not read lets nothing go."""
+    p, fake = ddns(made, env, VULTR_DDNS_HOSTS="@.example.net")
+    p.ddns_update(force=False)
+    assert p.keeper().known() == ["example.net"]
+    monkeypatch.delenv("VULTR_DDNS_HOSTS")
+    p.settings_changed()
+    fake.fail[("GET", "/domains")] = (403, "Unauthorized")
+    p.refresh()  # the domains not read: nothing settled
+    assert p.keeper().known() == ["example.net"]
+    del fake.fail[("GET", "/domains")]
+    p.refresh()
+    assert p.keeper().known() == []
 
 
 def test_a_pass_under_way_writes_nothing_once_the_plugin_is_detached(made, monkeypatch):

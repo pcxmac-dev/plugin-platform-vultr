@@ -108,13 +108,16 @@ OpenDNS's 208.67.222.222, else Google's `o-o.myaddr.l.google.com` of 216.239.32.
 - a host **already pointing at this network's address**, or at **the address it set last** (kept in the platform's
   folder, `vultr/ddns.json`, so a restart after the address changed still knows it): kept current, set only when it
   differs;
-- a host you **took over** on the page (**Take over…**: its confirmation names what the record holds and says that
-  whatever answers there stops answering at that host): set to this network's address alone.
+- a host you **took over** on the page (**Take over…**, asked twice: its confirmation names what the record holds and
+  says that whatever answers there stops answering at that host; its second, "Drop what it holds?", that every address
+  it holds is dropped at once): set to this network's address alone.
 
 Any other host, one holding another address or several, is **left as it is** and said so ("holds 198.51.100.7, not this
 network's address"), its row offering Take over…; several addresses are never cut to one unasked. **Update DNS now**
 (confirmed) sets every host that is its own, even where it already holds the address. The address is asked again just
-before a write, and nothing is written if it changed meanwhile. A host taken out of the settings is let go. A host that
+before a write, and nothing is written if it changed meanwhile. A host taken out of the setting is let go, while
+the plugin ran or not (each pass and each refresh settle the keeper against the whole setting, once the account's
+domains are read): put back later, one holding another address is left as it is until taken over again. A host that
 is a CNAME, or in no domain on the account's Vultr DNS, is said, not touched. Dynamic DNS goes through the API, so it
 needs the key too.
 
@@ -136,9 +139,10 @@ minutes later. A part the key may not read (an HTTP 403) leaves the plugin valid
 `add_record(domain, name, rtype, data, ttl=None, priority=None)`, `remove_record(domain, record, name, rtype, data)`,
 `add_rule(group, ip_type, protocol, port, subnet, subnet_size, notes="", accept_risk=False)`,
 `remove_rule(group, rule, protocol, port, source, accept_risk=False)`, `add_key(name, ssh_key)`, `remove_key(key, name)`,
-`ddns_update(force=True)`, `ddns_take_over(host, holds=None)`. What names a thing as the page showed it (a label, a
+`ddns_update(force=True)`, `ddns_take_over(host, holds=None, accept_take_over=False)`. What names a thing as the page showed it (a label, a
 record's name, type and data) is needed. A refusal is a `ValueError` (`records.Refusal`), its `accept` naming the
-argument that accepts it (`accept_reboot`, `accept_halt`, `accept_risk`, `accept_replace`): the page's second
+argument that accepts it (`accept_reboot`, `accept_halt`, `accept_risk`, `accept_replace`, `accept_take_over`): the
+page's second
 confirmation, counted only when it is `True` itself. A change's answer: `said`, `lines` (what was sent and the check
 after it), `ok`.
 
