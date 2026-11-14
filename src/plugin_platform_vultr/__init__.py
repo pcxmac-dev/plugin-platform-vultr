@@ -44,7 +44,7 @@ from .card import APIS, VULTR_API
 from .records import TYPES, Refusal
 from .settings import ACCESS_CONTROL, API_KEY, CONSOLE_API, DDNS_HOSTS, KEYS, NAMES, WHERE_KEY, Config
 
-__version__ = "0.1.3"
+__version__ = "0.1.4"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -201,6 +201,7 @@ class VultrPlugin(MachinePlugin):
     api = "2.2"
     order = 762
     ICON = "vultr"  # Vultr's V (liminal-libs 1.49.0's icons.js)
+    SECTION = "cloud"  # drawn under the platform's Cloud plugins (liminal-libs 1.51.0, liminal-platform 0.25.0)
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "balance", "servers", "domains", "records", "firewalls", "ssh_keys",
              "start", "reboot", "halt", "set_record", "add_record", "remove_record", "add_rule", "remove_rule", "add_key",
              "remove_key", "ddns_update", "ddns_take_over")
