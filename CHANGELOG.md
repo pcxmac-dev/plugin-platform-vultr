@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.1.5 (2026-11-24)
+
+Removing a host's other records bound to the ones the refusal showed (the review of 2026-11-21, item 26). `set_record`
+over a host with several records of its type is refused once, naming the ones it removes; with `accept_replace` it
+then removed whatever the host held by the time the confirmation came. The page sends the same arguments again with
+its second confirmation, so the refusal now keeps the records it named (IDs and data, by the change asked, for 15
+minutes, 32 at most), and the accepted call is refused, nothing sent, when the host's records of the type are any
+others now, or when no refusal showed them lately: set again, the new refusal names what it holds now. Binding as
+liminal-libs 1.49.9's take-over binds `holds`. Test: an accept never shown, then one whose records changed after its
+refusal, both refused with nothing written; asked again, replaced.
+
 ## 0.1.4 (2026-11-14)
 
 Drawn under the platform's Cloud plugins section, in the list on the left (the user: "classify the cloud plugins under the 'cloud plugins' section which should be on the far left"): `SECTION = "cloud"`. That is liminal-libs

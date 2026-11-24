@@ -44,7 +44,7 @@ from .card import APIS, VULTR_API
 from .records import TYPES, Refusal
 from .settings import ACCESS_CONTROL, API_KEY, CONSOLE_API, DDNS_HOSTS, KEYS, NAMES, WHERE_KEY, Config
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -53,6 +53,8 @@ REGIONS_KEEP_S = 86400.0  # the regions read again after this long
 UNKNOWN_RETRY_S = 3600.0  # a plan or a region not in the list read again for it at most this often
 ZONES_MAX = 25  # the domains whose records a refresh reads (the rest: `records DOMAIN`)
 GROUPS_MAX = 25  # the firewall groups whose rules a refresh reads
+SHOWN_S = 900.0  # a refusal's "replace them?" answered within this long is bound to what it showed; later, asked again
+SHOWN_MAX = 32  # the refusals kept for their confirmations at most
 DDNS_TTL = 300  # the TTL of an A record Dynamic DNS makes (the reference's examples' 300 s)
 ACCEPT_HALT = "accept_halt"  # the halt's argument accepting it (Refusal's accept): the page's second confirmation
 ACCEPT_REBOOT = "accept_reboot"  # the reboot's (a hard reboot: asked twice, as a halt is)
@@ -188,6 +190,21 @@ class _Runtime:
         self.stop: threading.Event | None = None
         self.wake = threading.Event()
         self.refreshing = threading.Lock()
+        self.shown: dict[tuple, tuple[float, tuple]] = {}  # a replacement refused: what its refusal showed, by the change
+
+    def show(self, key: tuple, held: tuple) -> None:
+        """What a refusal showed the user, kept for the confirmation that answers it (SHOWN_S, SHOWN_MAX at most)."""
+        with self.lock:
+            self.shown.pop(key, None)
+            while len(self.shown) >= SHOWN_MAX:
+                del self.shown[next(iter(self.shown))]
+            self.shown[key] = (time.monotonic(), held)
+
+    def shown_for(self, key: tuple) -> tuple | None:
+        """What the refusal of this change showed (taken: a confirmation answers one refusal), None when none did lately."""
+        with self.lock:
+            at, held = self.shown.pop(key, (None, None))
+        return held if at is not None and time.monotonic() - at <= SHOWN_S else None
 
 
 class VultrPlugin(MachinePlugin):
@@ -547,8 +564,26 @@ class VultrPlugin(MachinePlugin):
         api = self.client()
         held = zones.records_of(api.records(d), d)
         plan = zones.plan_set(held, d, name, rtype, data, ttl=ttl)
-        if plan.removes and accept_replace is not True:
+        if plan.removes:
+            # The confirmation is bound to the records its refusal showed (the review of 2026-11-21, item 26:
+            # accept_replace removed whatever the host held by then). The page sends the same arguments again with it,
+            # so the refusal's records are kept here, and the accepted call is refused, nothing sent, unless the host's
+            # records of the type are exactly those still (as liminal-libs 1.49.9's take-over binds `holds`).
             host = zones.relative(name, d) or "@"
+            kind = str(rtype).strip().upper()
+            key = (d, host, kind, str(data).strip())
+            shown_now = tuple(sorted((r.id, r.data) for r in held if r.name == zones.relative(name, d) and r.type == kind))
+            if accept_replace is True:
+                shown = self._rt.shown_for(key)
+                if shown is None:
+                    raise Refusal(f"{host}'s {kind} records were not shown by a refusal lately: nothing sent (set it again "
+                                  "to see what it removes)")
+                if shown != shown_now:
+                    raise Refusal(f"{host}'s {kind} records are {', '.join(v for _, v in shown_now) or 'none'} now, not "
+                                  f"{', '.join(v for _, v in shown)} as the confirmation showed: nothing sent (set it "
+                                  "again to see what it removes)")
+                return self._applied(d, plan, held, name, rtype, api)
+            self._rt.show(key, shown_now)
             raise Refusal(f"{host} holds {len(plan.removes) + 1} {str(rtype).strip().upper()} records: setting it to "
                           f"{data} replaces them all, so {', '.join(r.data for r in plan.removes)} "
                           f"{'is' if len(plan.removes) == 1 else 'are'} removed. Nothing was sent: it is done only once "

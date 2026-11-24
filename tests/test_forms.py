@@ -372,3 +372,28 @@ def test_ssh_keys_are_added_and_removed(made, env):
     rep = p.ask("remove_key", *page_args(forms["key-remove"], laptop["values"]))
     assert fake.writes()[-1] == ("DELETE", "/ssh-keys/3b8066a7-b438-455a-9688-44afc9a3597f", None)
     assert rep["ok"] and rep["said"] == "removed the key laptop" and [k["name"] for k in fake.keys] == ["ci"]
+
+
+def test_removing_a_hosts_other_records_is_bound_to_the_ones_its_refusal_showed(made, env):
+    """The review of 2026-11-21, item 26: accept_replace removed whatever the host held by the time it came. The
+    confirmation is bound to the records its refusal named: changed since, or never shown, nothing is sent."""
+    fake = FakeVultr()
+    fake.records["example.com"].append({"id": "a0a0a0a0-0000-4000-8000-000000000007", "type": "A", "name": "home",
+                                        "data": "198.51.100.8", "ttl": 120, "priority": 0})
+    p, fake, forms = ready(made, env, fake)
+    s = forms["set:example.com"]
+    values = {"name": "home", "rtype": "A", "data": HOME}
+    writes = fake.writes()
+    with pytest.raises(Refusal, match="records were not shown by a refusal lately: nothing sent"):
+        p.ask("set_record", *page_args(s, values, accepted={ACCEPT_REPLACE}))
+    with pytest.raises(Refusal, match="so 198.51.100.8 is removed"):
+        p.ask("set_record", *page_args(s, values))
+    fake.records["example.com"][-1]["data"] = "198.51.100.9"  # someone else's change between the two
+    with pytest.raises(Refusal, match=r"home's A records are .*198\.51\.100\.9 now, not .*198\.51\.100\.8 as the "
+                                      "confirmation showed: nothing sent"):
+        p.ask("set_record", *page_args(s, values, accepted={ACCEPT_REPLACE}))
+    assert fake.writes() == writes
+    with pytest.raises(Refusal, match="so 198.51.100.9 is removed"):  # asked again: what it holds now
+        p.ask("set_record", *page_args(s, values))
+    rep = p.ask("set_record", *page_args(s, values, accepted={ACCEPT_REPLACE}))
+    assert rep["ok"] and "the host's other A records removed (198.51.100.9)" in rep["said"]
