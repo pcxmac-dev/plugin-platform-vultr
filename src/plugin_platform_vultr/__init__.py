@@ -19,6 +19,13 @@ app (the charts app run alone), not set up, or detached, nothing of it runs. Its
 status is what was read last (no request is made to answer it): the platform's page draws its tables, its actions
 (Refresh, Update DNS now) and its forms.
 
+Who may ask its changes (0.1.6; the independent review's PLT-H1 and the sweep of the plugins after it, 2026-11-25): an
+instance started, rebooted or halted, a record set, added or removed, a firewall group's rule added or removed, an SSH key
+added or removed, a Dynamic DNS pass and a host taken over are asked only from its page (PAGE_ONLY_HOOKS): another plugin's
+ask is refused, and the platform asks its login whether you are at the page. Before, any program on this PC could ask them
+of the platform with a header anyone can send, and the API key did the rest; a second confirmation is an argument the asker
+sets. Its reads are asked by anyone. The background and the command line call the same code themselves: those are not asks.
+
     python -m plugin_platform_vultr status | account | servers | domains | records DOMAIN | firewalls | keys | ddns [--now]
         | power NAME on|off|reboot | set DOMAIN NAME TYPE DATA [--ttl N] | add DOMAIN NAME TYPE DATA [--ttl N] [--priority N]
         | remove DOMAIN NAME TYPE [DATA]
@@ -44,7 +51,7 @@ from .card import APIS, VULTR_API
 from .records import TYPES, Refusal
 from .settings import ACCESS_CONTROL, API_KEY, CONSOLE_API, DDNS_HOSTS, KEYS, NAMES, WHERE_KEY, Config
 
-__version__ = "0.1.5"
+__version__ = "0.1.6"
 REFRESH_S = 900.0  # the account read again at most this often while attached (or by Refresh)
 CONFIG_S = 30.0  # the settings asked of the login again after this long
 RETRY_S = 900.0  # a read that failed is taken as untried after this long while detached: attached again, it is tried again
@@ -222,6 +229,15 @@ class VultrPlugin(MachinePlugin):
     HOOKS = (*MachinePlugin.HOOKS, "refresh", "balance", "servers", "domains", "records", "firewalls", "ssh_keys",
              "start", "reboot", "halt", "set_record", "add_record", "remove_record", "add_rule", "remove_rule", "add_key",
              "remove_key", "ddns_update", "ddns_take_over")
+    # Its changes, asked only from its page (0.1.6, the sweep after the review's PLT-H1; liminal-libs 1.66.0's
+    # apps/asking.py): another plugin's ask is refused (403), and liminal-platform 0.34.0 refuses one over HTTP (401) unless
+    # its login shows that you are at the page. Before, any program on this PC could ask them of the platform with a header
+    # anyone can send, the page's dialogs being the only confirmation (a second one, accept_halt or accept_risk, is an
+    # argument the asker sets): an instance halted, a record set or removed, a firewall opened, with your API key. The
+    # background's reads and Dynamic DNS passes and the command line call the code directly, not through an ask; its reads
+    # (refresh and the lists among them) are asked by anyone.
+    PAGE_ONLY_HOOKS = ("start", "reboot", "halt", "set_record", "add_record", "remove_record", "add_rule", "remove_rule",
+                       "add_key", "remove_key", "ddns_update", "ddns_take_over")
     keys = KEYS
     signup = CONSOLE_API
     limits = f"Vultr's API: {RATE} (429 and Retry-After beyond); the plugin keeps to ten a second"

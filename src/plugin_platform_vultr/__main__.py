@@ -19,7 +19,9 @@ EnvironmentLogin: the variables as this shell has them).
     remove DOMAIN NAME TYPE [DATA]           a record removed, the rest kept
 
 Each change asks "yes" on the terminal first (a halt, a reboot and a set replacing others twice); --json prints the
-answer as JSON. The firewall rules and the SSH keys are changed from the platform's page."""
+answer as JSON. The firewall rules and the SSH keys are changed from the platform's page. The platform asks the plugin's
+changes only from its page (PAGE_ONLY_HOOKS, 0.1.6); this command line asks the platform nothing: it calls the same code
+in its own process, with this shell's settings, as before."""
 from __future__ import annotations
 
 import argparse
